@@ -1,0 +1,117 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ORM Application - Orbit Response Matrix Analyzer</title>
+    <link rel="stylesheet" href="styles.css">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
+</head>
+<body>
+    <header>
+        <nav>
+            <div class="logo">ORM Application</div>
+            <ul>
+                <li><a href="#features">Features</a></li>
+                <li><a href="#installation">Installation</a></li>
+                <li><a href="#documentation">Documentation</a></li>
+                <li><a href="https://github.com/Abhishek-Pathak-90/ORM-Application" target="_blank">GitHub</a></li>
+            </ul>
+        </nav>
+    </header>
+
+    <main>
+        <section id="hero">
+            <div class="hero-content">
+                <h1>Orbit Response Matrix Analyzer</h1>
+                <p>A powerful PyQt5 application for analyzing orbit response matrices from accelerator data</p>
+                <div class="cta-buttons">
+                    <a href="https://github.com/Abhishek-Pathak-90/ORM-Application" class="primary-btn">View on GitHub</a>
+                    <a href="#installation" class="secondary-btn">Get Started</a>
+                </div>
+            </div>
+        </section>
+
+        <section id="features">
+            <h2>Features</h2>
+            <div class="features-grid">
+                <div class="feature-card">
+                    <i class="fas fa-desktop"></i>
+                    <h3>Dark-Themed GUI</h3>
+                    <p>Modern dark UI with multiple tabs for Correctors, BPMs, Response Matrices, and Error Matrices</p>
+                </div>
+                <div class="feature-card">
+                    <i class="fas fa-chart-line"></i>
+                    <h3>Advanced Analysis</h3>
+                    <p>Time-domain and frequency-domain analysis with FFT-based spectra computation</p>
+                </div>
+                <div class="feature-card">
+                    <i class="fas fa-table"></i>
+                    <h3>Data Management</h3>
+                    <p>Import CSV data and manage device lists with automatic column identification</p>
+                </div>
+                <div class="feature-card">
+                    <i class="fas fa-file-export"></i>
+                    <h3>Export Options</h3>
+                    <p>Export tables as CSV and save plots as PNG/JPG formats</p>
+                </div>
+            </div>
+        </section>
+
+        <section id="installation">
+            <h2>Installation</h2>
+            <div class="installation-steps">
+                <div class="step">
+                    <h3>1. Clone the Repository</h3>
+                    <pre><code>git clone https://github.com/Abhishek-Pathak-90/ORM-Application.git
+cd ORM-Application</code></pre>
+                </div>
+                <div class="step">
+                    <h3>2. Install Dependencies</h3>
+                    <pre><code>pip install pyqt5 matplotlib numpy pandas</code></pre>
+                </div>
+                <div class="step">
+                    <h3>3. Run the Application</h3>
+                    <pre><code>python main.py</code></pre>
+                </div>
+            </div>
+        </section>
+
+        <section id="documentation">
+            <h2>Documentation</h2>
+            <div class="doc-grid">
+                <div class="doc-card">
+                    <h3>Data Import</h3>
+                    <p>Load CSV files containing time-domain signals of BPMs and corrector magnets. The application automatically identifies valid columns.</p>
+                </div>
+                <div class="doc-card">
+                    <h3>Analysis</h3>
+                    <p>Compute FFT spectra, build orbit response matrices, and calculate measurement errors using partial derivative approach.</p>
+                </div>
+                <div class="doc-card">
+                    <h3>Visualization</h3>
+                    <p>View time-domain plots, FFT spectra, and heatmaps of response and error matrices with adjustable font sizes.</p>
+                </div>
+            </div>
+        </section>
+    </main>
+
+    <footer>
+        <div class="footer-content">
+            <div class="footer-section">
+                <h4>Contact</h4>
+                <p>Email: walkwithtime@gmail.com</p>
+                <p><a href="https://github.com/Abhishek-Pathak-90/ORM-Application/issues">Report Issues</a></p>
+            </div>
+            <div class="footer-section">
+                <h4>Links</h4>
+                <p><a href="https://github.com/Abhishek-Pathak-90/ORM-Application">GitHub Repository</a></p>
+                <p><a href="https://github.com/Abhishek-Pathak-90/ORM-Application#readme">Documentation</a></p>
+            </div>
+        </div>
+        <div class="footer-bottom">
+            <p>&copy; 2023 Abhishek Pathak. MIT License.</p>
+        </div>
+    </footer>
+</body>
+</html>
