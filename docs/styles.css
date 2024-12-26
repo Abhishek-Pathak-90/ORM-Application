@@ -99,6 +99,16 @@ section {
     margin-bottom: 2rem;
 }
 
+.developer {
+    font-size: 1.1rem !important;
+    margin-bottom: 2rem !important;
+}
+
+.highlight {
+    color: var(--primary-color);
+    font-weight: 600;
+}
+
 .cta-buttons {
     display: flex;
     gap: 1rem;
