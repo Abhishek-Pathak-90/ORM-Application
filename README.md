@@ -48,12 +48,6 @@ This **PyQt5** application analyzes orbit response matrices (ORM) from accelerat
 - **Adjustable Plot Fonts**  
   Easily control plot font size via a spin box at the bottom.
 
----
-
-## Preview / Screenshots
-*(Optional – You can add screenshots or GIF animations here to showcase the UI.)*
-
-Example screenshot:
 
 ---
 
@@ -163,7 +157,7 @@ We welcome bug reports, feature requests, and code contributions! To contribute:
 ## License
 MIT License
 
-Copyright (c) 2023 [Your Name]
+Copyright (c) 2023 [Abhishek Pathak]
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -179,4 +173,4 @@ copies or substantial portions of the Software.
 If you have questions or issues:
 
 - Open a GitHub issue at https://github.com/your_username/orm-application/issues
-- Email: your_email@example.com
+- Email: walkwithtime@gmail.com
