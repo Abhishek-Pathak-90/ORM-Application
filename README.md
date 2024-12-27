@@ -1,6 +1,13 @@
 # ORM Application (Orbit Response Matrix Analyzer)
 
-This **PyQt5** application analyzes orbit response matrices (ORM) from accelerator data. It is designed to load time-domain signals of **BPMs** (Beam Position Monitors) and **corrector magnets**, compute FFT-based spectra, build orbit response matrices, and propagate measurement errors—all within a dark-themed GUI.
+This **PyQt5** application analyzes orbit response matrices (ORM) for accelerator/linac data. It provides a **dark-themed GUI** to:
+
+1. Load **BPM (Beam Position Monitor)** and **corrector magnet** data from CSV or text files.
+2. Parse **device positions** (BPMs, correctors, etc.) from a **multi-sheet Excel** file to exclude BPMs upstream of the first corrector.
+3. Plot **time-domain** and **frequency-domain** (FFT) signals for both BPMs and correctors.
+4. Build **Orbit Response Matrices** (ORM) and propagate measurement errors.
+5. Display **Noise Levels** (RMS error) for each device in a colorful bar chart.
+6. Export tables and plots in multiple formats.
 
 🌐 **Project Website:** [https://abhishek-pathak-90.github.io/ORM-Application/](https://abhishek-pathak-90.github.io/ORM-Application/)
 

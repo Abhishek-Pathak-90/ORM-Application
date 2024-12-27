@@ -5,6 +5,8 @@
     --surface-color: #1e293b;
     --text-color: #e2e8f0;
     --text-muted: #94a3b8;
+    --accent-color: #60a5fa;
+    --text-secondary: #a5f3fc;
 }
 
 * {
@@ -139,29 +141,42 @@ section {
 }
 
 /* Features Section */
-.features-grid {
+.feature-grid {
     display: grid;
     grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
     gap: 2rem;
-    margin-top: 2rem;
+    padding: 2rem 0;
 }
 
-.feature-card {
-    background-color: var(--surface-color);
-    padding: 2rem;
-    border-radius: 0.5rem;
+.feature-item {
+    background: rgba(255, 255, 255, 0.05);
+    border-radius: 10px;
+    padding: 1.5rem;
     text-align: center;
     transition: transform 0.3s ease;
+    box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
 }
 
-.feature-card:hover {
+.feature-item:hover {
     transform: translateY(-5px);
+    box-shadow: 0 6px 12px rgba(0, 0, 0, 0.15);
 }
 
-.feature-card i {
-    font-size: 2rem;
-    color: var(--primary-color);
+.feature-item i {
+    font-size: 2.5rem;
     margin-bottom: 1rem;
+    color: var(--accent-color);
+}
+
+.feature-item h3 {
+    margin: 0.5rem 0;
+    color: var(--text-color);
+}
+
+.feature-item p {
+    color: var(--text-secondary);
+    font-size: 0.9rem;
+    line-height: 1.5;
 }
 
 /* Installation Section */
@@ -262,7 +277,7 @@ footer {
         flex-direction: column;
     }
 
-    .features-grid {
+    .feature-grid {
         grid-template-columns: 1fr;
     }
 }
