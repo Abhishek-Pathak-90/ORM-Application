@@ -1,0 +1,47 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Generated scan data
+scan_data_*.csv
+PARTIAL_scan_data_*.csv
+*_meta.json
+settings_log.csv
+response_matrix_*.csv
+response_matrix_*.png
+
+# Runtime logs and output
+*.log
+acsys_monitor_*.log
+safety_logs/
+data/
+
+# LaTeX build artifacts
+*.aux
+*.toc
+*.lof
+*.lot
+*.nav
+*.out
+*.snm
+*.synctex.gz
+*.fdb_latexmk
+*.fls
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp

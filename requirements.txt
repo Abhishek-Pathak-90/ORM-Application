@@ -1,0 +1,14 @@
+# Core dependencies for FORMA
+numpy>=1.19.0
+pandas>=2.0.0
+matplotlib>=3.3.0
+scipy>=1.5.0
+openpyxl>=3.0.0
+
+# Optional but recommended
+pyyaml>=5.3
+h5py>=2.10.0
+
+# Note: acsys module needs to be installed separately from Fermilab sources
+# Note: tkinter usually comes with Python installation
+PyQt5>=5.15.0
