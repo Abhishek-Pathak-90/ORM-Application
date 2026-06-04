@@ -1,24 +1,43 @@
 """
 FORMA - FFT-based Orbit Response Matrix Analyzer
 
-CHANGE FROM v4:
-    This version uses actual READBACKS for setting devices (correctors) instead
-    of the .SETTING property (commanded setpoints) when collecting scan data
-    and calculating the Orbit Response Matrix (ORM).
+ORM data convention (carried over from v4):
+    The ORM is computed from actual READBACKS for setting devices (correctors),
+    NOT the .SETTING property (commanded setpoints). This makes the matrix account
+    for discrepancies between commanded settings and actual corrector output
+    (power-supply limits, saturation, calibration error, slew-rate limiting).
+    .SETTING (commanded) values are recorded alongside the readbacks in the scan
+    CSV for comparison (columns with a .SETTING suffix, e.g. H:C1 for readback,
+    H:C1.SETTING for setpoint) but are EXCLUDED from the ORM analysis. Loading v4
+    files that already contain .SETTING columns is still supported.
 
-    This change ensures the ORM calculation accounts for any discrepancies between
-    commanded settings and actual corrector output due to:
-    - Power supply limitations
-    - Saturation effects
-    - Calibration errors
-    - Slew rate limiting
+CHANGES IN v5 (hardening + safety/observability pass, #1-#8):
+    #1 Loss-monitor trip restores correctors to nominal BEFORE disabling the beam,
+       and tripping requires a positive read-back confirmation that the beam is
+       actually OFF (BeamInterlockMonitor.trip_beam) before continuing; an
+       unconfirmed trip escalates to a modal instead of silently proceeding.
+    #2 ACNET SET/disable replies are now status-validated: apply_settings_once and
+       disable_beam return a confirmed/rejected bool instead of treating any reply
+       as success. Rejected corrector SETs are recorded to Device Health.
+    #3 Read paths log error/status replies and leave the slot None instead of
+       mistaking a status for a reading.
+    #4/#5 New "Device Health" tab renders per-device missed / non-finite /
+       set-rejected counts and last-seen after each scan; beam ON/OFF/Refresh
+       buttons and the interlock-enable toggle are disabled while a scan runs.
+    #5 Beam button handlers and pre-scan beam/loss reads run on a short worker
+       thread (still through the single shared ACNET executor) and marshal results
+       back to Tk via self.after(0, ...), so they no longer block the Tk main loop.
+    #6 NaN/inf readings are guarded in the safety monitor (not buffered, never
+       poison the mean) and reported to Device Health without aborting.
+    #7 Scan CSV / response-matrix CSV / JSON meta / safety-log writes go through
+       utils.file_operations atomic helpers (temp file + os.replace, fsync,
+       encoding='utf-8'); the *_meta.json filename is derived from the path's real
+       extension instead of str.replace('.csv', ...) (which replaced every match).
+    #8 ORM error propagation includes the manual's 1/2 factor on BOTH terms
+       (eq:errorprop).
 
-    Additionally, .SETTING values (commanded setpoints) are now recorded alongside
-    readbacks in the scan CSV for comparison. These appear as separate columns with
-    a .SETTING suffix (e.g. H:C1 for readback, H:C1.SETTING for setpoint).
-
-    Backward compatibility is maintained for loading data files created with v4
-    that contain .SETTING column names.
+    A pinned-acsys compatibility check (utils.acsys_compat, EXPECTED_ACSYS_VERSION)
+    runs at acnet_scanner import time so an incompatible DPM reply API fails loud.
 """
 
 import tkinter as tk
@@ -39,6 +58,7 @@ from functools import reduce
 import getpass
 import asyncio
 import csv
+import io
 import math
 import queue
 import warnings
@@ -58,6 +78,7 @@ from models.beam_interlock import BeamInterlockConfig, BeamStatus, BeamTripEvent
 from backend.beam_interlock import BeamInterlockMonitor
 from ui.dialogs import KerberosLoginDialog, DeviceSelectionDialog, ConfirmationDialog
 from utils.safety_monitor import SafetyMonitor
+from utils.file_operations import atomic_write_text, atomic_to_csv
 
 # Import configuration
 from config.settings import (
@@ -69,7 +90,7 @@ from config.settings import (
     SAFETY_WARNING_COLOR, SAFETY_ABORT_COLOR, SAFETY_DISABLED_COLOR,
     ACNET_MAX_CONSECUTIVE_TIMEOUTS, ACNET_RESTORE_VERIFY_TOLERANCE,
     BEAM_INTERLOCK_ENABLED_BY_DEFAULT, DEFAULT_LOSS_MONITORS,
-    BEAM_CONTROL_DRF,
+    BEAM_CONTROL_DRF, LOSS_MONITOR_MAX_CONSECUTIVE_MISSES,
 )
 
 # ############################################################################
@@ -143,6 +164,10 @@ class DeviceControlApp(tk.Tk):
         self.is_scanning = False
         self.plot_data = {}
         self.device_stats = {}
+        # Per-device health accounting populated by the scan worker (missed /
+        # non-finite / rejected-SET counts + last_seen). Initialized empty so the
+        # UI can render it before any scan runs; reset to {} at each scan start.
+        self.device_health = {}
         self.last_analysis_source = None
         self._analysis_processes = []
         self.data_queue = queue.Queue()
@@ -182,6 +207,10 @@ class DeviceControlApp(tk.Tk):
         self.plotted_device = tk.StringVar()
         self.scan_data_path = tk.StringVar(value=os.getcwd())
         self.scan_mode = tk.StringVar(value="Simultaneous")
+        # Opt-in: drive a Simultaneous scan with the persistent advance-on-event
+        # engine (machine-validated 2026-06-04, ~6x faster). Default OFF keeps the
+        # existing serial _synchronous_scan_loop as the path.
+        self.use_persistent_scan = tk.BooleanVar(value=False)
         self.auto_calc_orm = tk.BooleanVar(value=False)
         
         # Scan parameters
@@ -237,6 +266,7 @@ class DeviceControlApp(tk.Tk):
         self.stats_tab = ttk.Frame(self.tabControl, style="Main.TFrame")
         self.fft_tab = ttk.Frame(self.tabControl, style="Main.TFrame")
         self.response_tab = ttk.Frame(self.tabControl, style="Main.TFrame")
+        self.device_health_tab = ttk.Frame(self.tabControl, style="Main.TFrame")
         self.log_tab = ttk.Frame(self.tabControl, style="Main.TFrame")
         self.tabControl.add(self.settings_tab, text='Device Settings & Selection')
         self.tabControl.add(self.scan_tab, text='Scan Settings')
@@ -246,6 +276,7 @@ class DeviceControlApp(tk.Tk):
         self.tabControl.add(self.stats_tab, text='Statistics')
         self.tabControl.add(self.fft_tab, text='FFT Analysis')
         self.tabControl.add(self.response_tab, text='Response Matrix')
+        self.tabControl.add(self.device_health_tab, text='Device Health')
         self.tabControl.add(self.log_tab, text='Activity Log')
         self.tabControl.pack(expand=1, fill="both", padx=10, pady=10)
 
@@ -258,6 +289,7 @@ class DeviceControlApp(tk.Tk):
         self._create_fft_widgets()
         self._create_rms_widgets()
         self._create_response_matrix_widgets()
+        self._create_device_health_widgets()
         self._create_log_viewer()
 
         # Add a menu for login
@@ -556,6 +588,10 @@ class DeviceControlApp(tk.Tk):
         scan_mode_frame.pack(fill='x', pady=5)
         ttk.Radiobutton(scan_mode_frame, text="Simultaneous", variable=self.scan_mode, value="Simultaneous").pack(side='left', padx=10)
         ttk.Radiobutton(scan_mode_frame, text="Sequential", variable=self.scan_mode, value="Sequential").pack(side='left', padx=10)
+        # Opt-in persistent engine (Simultaneous only for now; Sequential keeps the
+        # serial path until the persistent path is machine-validated end to end).
+        ttk.Checkbutton(scan_mode_frame, text="Persistent (advance-on-event, ~6x — Simultaneous only)",
+                        variable=self.use_persistent_scan).pack(side='left', padx=20)
 
         # Frame for save location
         save_loc_frame = ttk.LabelFrame(main_frame, text="Scan Data Save Location", padding=8, style="Section.TLabelframe")
@@ -886,9 +922,14 @@ class DeviceControlApp(tk.Tk):
         )
         self.beam_status_label.pack(side='left', padx=(0, 10))
 
-        ttk.Button(beam_control_frame, text="Beam ON", command=self._on_beam_enable, style="Accent.TButton").pack(side='left', padx=5)
-        ttk.Button(beam_control_frame, text="Beam OFF", command=self._on_beam_disable).pack(side='left', padx=5)
-        ttk.Button(beam_control_frame, text="Refresh Status", command=self._refresh_beam_status).pack(side='left', padx=5)
+        # Keep references so these can be disabled while a scan is running
+        # (#4/#5) — ACNET button handlers must not be invoked mid-scan.
+        self.beam_enable_button = ttk.Button(beam_control_frame, text="Beam ON", command=self._on_beam_enable, style="Accent.TButton")
+        self.beam_enable_button.pack(side='left', padx=5)
+        self.beam_disable_button = ttk.Button(beam_control_frame, text="Beam OFF", command=self._on_beam_disable)
+        self.beam_disable_button.pack(side='left', padx=5)
+        self.beam_refresh_button = ttk.Button(beam_control_frame, text="Refresh Status", command=self._refresh_beam_status)
+        self.beam_refresh_button.pack(side='left', padx=5)
 
         self.disable_beam_on_completion_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(
@@ -1091,8 +1132,10 @@ class DeviceControlApp(tk.Tk):
         corrector output rather than commanded setpoints, accounting for any discrepancies
         due to power supply limitations, saturation, or calibration errors.
 
-        Setting values (.SETTING) are read separately via get_settings_once at each
-        scan step and merged into the scan data with a .SETTING column suffix.
+        Setting values (.SETTING) are recorded as the analytically COMMANDED
+        setpoint (ScanDeviceConfig.compute_value) and merged into the scan data
+        with a .SETTING column suffix (Phase 1 — no per-step readback round-trip).
+        They are excluded from the ORM, which uses the readbacks above.
 
         Args:
             acnet_event: Pre-captured ACNET event string. If None, reads from tkinter
@@ -1106,6 +1149,328 @@ class DeviceControlApp(tk.Tk):
         # Use readbacks for all devices (not .SETTING for correctors)
         drf_list = [f"{dev}{acnet_event}" for dev in all_devices]
         return drf_list, all_devices
+
+    # =========================================================================
+    # Device Health (per-device missed / non-finite / rejected-SET accounting)
+    # =========================================================================
+    #
+    # self.device_health is a plain dict, keyed by device name, accumulated by
+    # the scan worker thread. Each entry is:
+    #   {
+    #     'missed':       int,            # reading absent (None/timeout) this many times
+    #     'nonfinite':    int,            # reading was NaN/inf this many times
+    #     'set_rejected': int,            # a corrector SET to this device was rejected
+    #     'last_seen':    datetime|None,  # last time a FINITE reading was received
+    #   }
+    # Individual-device problems are recorded here and NEVER abort the scan; the
+    # UI pass renders this structure. Only TOTAL loss (all-None for 5 consecutive
+    # steps) or a loss-monitor / safety abort stops the scan.
+
+    def _device_health_entry(self, device: str) -> dict:
+        """Return (creating if needed) the device_health record for `device`."""
+        entry = self.device_health.get(device)
+        if entry is None:
+            entry = {'missed': 0, 'nonfinite': 0, 'set_rejected': 0,
+                     'last_seen': None}
+            self.device_health[device] = entry
+        return entry
+
+    def _record_device_problem(self, device: str, kind: str):
+        """Increment a per-device problem counter ('missed'/'nonfinite'/
+        'set_rejected'). Worker-thread only; never raises, never aborts."""
+        try:
+            entry = self._device_health_entry(device)
+            if kind in entry:
+                entry[kind] += 1
+        except Exception as e:
+            print(f"[WARNING] Could not record device health for {device}: {e}")
+
+    def _record_device_seen(self, device: str, stamp=None):
+        """Mark `device` as having delivered a finite reading (updates last_seen)."""
+        try:
+            entry = self._device_health_entry(device)
+            entry['last_seen'] = stamp if stamp is not None else datetime.now()
+        except Exception:
+            pass
+
+    @staticmethod
+    def _meta_path_for(csv_path) -> str:
+        """Derive the `_meta.json` sidecar path from a CSV path.
+
+        Replaces ONLY the final extension (via os.path.splitext) so a path that
+        contains the substring '.csv' more than once — e.g. a directory named
+        'foo.csv_runs/' — is handled correctly. The old
+        str.replace('.csv', '_meta.json') replaced EVERY occurrence.
+        """
+        base, _ext = os.path.splitext(os.fspath(csv_path))
+        return base + "_meta.json"
+
+    def _account_bpm_step_health(self, data_from_step, expected_devices,
+                                 extra_nonfinite=None):
+        """Per-device exclude-and-report accounting for one scan step.
+
+        Records to self.device_health (does NOT abort):
+          * devices whose slot is None/missing this step  -> 'missed'
+          * devices whose reading value is NaN/inf         -> 'nonfinite'
+          * devices with a finite reading                  -> updates 'last_seen'
+
+        This is self-contained (detects non-finite values directly) so it works
+        even when safety monitoring is disabled. The safety monitor's own
+        non-finite flagging is recorded SEPARATELY by the caller via nonfinite_out.
+
+        Args:
+            data_from_step: BPM/scan slice of the read (list of dicts/None).
+            expected_devices: device names that should have been read this step.
+            extra_nonfinite: optional iterable of additional device names to mark
+                non-finite (kept for symmetry; normally None).
+        """
+        extra_set = set(extra_nonfinite or [])
+        seen_names = set()
+        for item in data_from_step:
+            if isinstance(item, dict):
+                name = item.get('name')
+                if not name:
+                    continue
+                seen_names.add(name)
+                value = item.get('data')
+                is_finite = False
+                try:
+                    is_finite = math.isfinite(float(value))
+                except (TypeError, ValueError):
+                    is_finite = False
+                if is_finite and name not in extra_set:
+                    self._record_device_seen(name, item.get('stamp'))
+                else:
+                    # Present but unusable (NaN/inf/non-scalar): reported,
+                    # excluded from analysis, never aborting.
+                    self._record_device_problem(name, 'nonfinite')
+        # Any expected device with no slot/None this step is "missed".
+        for dev in expected_devices:
+            if dev not in seen_names:
+                self._record_device_problem(dev, 'missed')
+
+    def _record_rejected_correctors(self, devices):
+        """Record each corrector whose SET was rejected (apply_settings_once
+        returned False). Does NOT abort — the scan continues."""
+        for dev in devices:
+            self._record_device_problem(dev, 'set_rejected')
+        print(f"[WARNING] Corrector SET reported NOT confirmed for: "
+              f"{', '.join(devices)} — recorded to Device Health, continuing scan")
+
+    # =========================================================================
+    # Device Health tab (#4)
+    # =========================================================================
+
+    def _create_device_health_widgets(self):
+        """Build the Device Health tab.
+
+        Renders self.device_health (populated by the scan worker) as a table:
+        device, role (BPM/corrector/loss), missed count, non-finite count, and a
+        status summary (excluded/dead/set-rejected/...) plus last-seen. The table
+        is (re)populated on the main thread when a scan completes.
+        """
+        main_frame = ttk.LabelFrame(
+            self.device_health_tab, text="Per-Device Scan Health",
+            padding=12, style="Card.TLabelframe")
+        main_frame.pack(padx=10, pady=10, fill="both", expand=True)
+
+        ttk.Label(
+            main_frame,
+            text=("Per-device accounting from the most recent scan. Individual "
+                  "device problems are reported here and never abort the scan. "
+                  "Absence from this table means no problems were recorded."),
+            style="Info.TLabel",
+            wraplength=820,
+        ).pack(anchor='w', pady=(0, 8))
+
+        self.device_health_summary_label = ttk.Label(
+            main_frame, text="No scan has completed yet.", style="Info.TLabel")
+        self.device_health_summary_label.pack(anchor='w', pady=(0, 8))
+
+        table_frame = ttk.Frame(main_frame, style="Main.TFrame")
+        table_frame.pack(fill="both", expand=True)
+
+        dh_cols = ('Device', 'Role', 'Missed', 'Non-finite',
+                   'Set Rejected', 'Status', 'Last Seen')
+        self.device_health_tree = ttk.Treeview(
+            table_frame, columns=dh_cols, show='headings')
+        widths = {
+            'Device': 160, 'Role': 90, 'Missed': 70, 'Non-finite': 80,
+            'Set Rejected': 90, 'Status': 150, 'Last Seen': 150,
+        }
+        for col in dh_cols:
+            self.device_health_tree.heading(col, text=col)
+            anchor = 'w' if col in ('Device', 'Status', 'Last Seen') else 'center'
+            self.device_health_tree.column(col, width=widths[col], anchor=anchor)
+        self.device_health_tree.pack(side='left', fill='both', expand=True)
+
+        dh_scroll = ttk.Scrollbar(table_frame, command=self.device_health_tree.yview)
+        self.device_health_tree.config(yscrollcommand=dh_scroll.set)
+        dh_scroll.pack(side='right', fill='y')
+
+        btn_frame = ttk.Frame(main_frame, style="Main.TFrame")
+        btn_frame.pack(fill='x', pady=(8, 0))
+        ttk.Button(btn_frame, text="Refresh",
+                   command=self._populate_device_health).pack(side='left')
+
+    def _classify_device_role(self, device: str) -> str:
+        """Best-effort role label for a device in the Device Health table.
+
+        Loss-monitor and corrector lists take precedence over the reading list so
+        a device that appears in more than one (rare) is labelled by its most
+        specific role.
+        """
+        try:
+            loss_devs = set(self._loss_monitor_devices_from_config(
+                self.beam_interlock_config))
+        except Exception:
+            loss_devs = set()
+        if device in loss_devs:
+            return "loss"
+        if device in set(self.setting_devices):
+            return "corrector"
+        if device in set(self.reading_devices):
+            return "BPM"
+        return "—"
+
+    def _device_health_status_text(self, device: str, entry: dict) -> str:
+        """Human-readable status summary for one Device Health row."""
+        parts = []
+        if device in getattr(self, 'dead_bpms', set()):
+            parts.append("dead/excluded")
+        if entry.get('set_rejected', 0):
+            parts.append("set-rejected")
+        if entry.get('nonfinite', 0):
+            parts.append("non-finite excluded")
+        if entry.get('missed', 0):
+            parts.append("missed reads")
+        if not parts:
+            parts.append("OK")
+        return ", ".join(parts)
+
+    def _populate_device_health(self):
+        """Render self.device_health into the Device Health tree (main thread).
+
+        Best-effort: device_health is a plain dict written by the worker thread;
+        call this only after the scan has completed (e.g. from _on_scan_complete).
+        """
+        tree = getattr(self, 'device_health_tree', None)
+        if tree is None:
+            return
+        try:
+            for item in tree.get_children():
+                tree.delete(item)
+        except tk.TclError:
+            return
+
+        # Snapshot to avoid surprises if the worker is still finishing up.
+        health = dict(self.device_health or {})
+        problem_count = 0
+        for device in sorted(health.keys()):
+            entry = health[device] or {}
+            missed = entry.get('missed', 0)
+            nonfinite = entry.get('nonfinite', 0)
+            set_rejected = entry.get('set_rejected', 0)
+            if missed or nonfinite or set_rejected or device in getattr(self, 'dead_bpms', set()):
+                problem_count += 1
+            last_seen = entry.get('last_seen')
+            if isinstance(last_seen, datetime):
+                last_seen_text = last_seen.strftime('%Y-%m-%d %H:%M:%S')
+            elif last_seen is None:
+                last_seen_text = "never"
+            else:
+                last_seen_text = str(last_seen)
+            tree.insert('', 'end', values=(
+                device,
+                self._classify_device_role(device),
+                missed,
+                nonfinite,
+                set_rejected,
+                self._device_health_status_text(device, entry),
+                last_seen_text,
+            ))
+
+        label = getattr(self, 'device_health_summary_label', None)
+        if label is not None:
+            if not health:
+                label.config(text="No device problems recorded in the last scan.")
+            else:
+                label.config(
+                    text=(f"{len(health)} device(s) tracked, "
+                          f"{problem_count} with recorded problems."))
+
+    # =========================================================================
+    # Frozen-config loss-monitor helpers
+    # =========================================================================
+
+    def _loss_monitor_devices_from_config(self, config) -> list:
+        """Enabled+positive-threshold loss-monitor device names from a config
+        snapshot (mirrors BeamInterlockMonitor.loss_monitor_devices but reads an
+        explicit config so the scan worker uses the frozen snapshot, not live)."""
+        if config is None or not config.enabled:
+            return []
+        return [dev for dev, thresh in config.loss_monitors.items()
+                if thresh > 0]
+
+    def _restore_correctors_on_trip(self, restore_devices, restore_values, role):
+        """Restore correctors to nominal on a loss-monitor trip, BEFORE tripping
+        the beam (#1). Runs to completion with NO abort_check (safety-critical).
+        Never raises — called from the live scan loop, mirrors the finally-block
+        restore pattern (single credential-renewal retry). Records a rejected SET
+        to Device Health but does not abort here (the trip is already aborting)."""
+        if not (restore_devices and restore_values):
+            return
+        print("[WARNING] Loss-monitor trip — restoring correctors to nominal "
+              "BEFORE disabling beam")
+        try:
+            ok = self.scanner.apply_settings_once(restore_devices, restore_values, role)
+            if ok is False:
+                self._record_rejected_correctors(restore_devices)
+        except CredentialExpiredError:
+            print("[WARNING] Credential expired during trip restore — attempting renewal...")
+            if self._renew_kerberos_ticket():
+                try:
+                    self.scanner.apply_settings_once(restore_devices, restore_values, role)
+                    print("[SUCCESS] Correctors restored after credential renewal.")
+                except Exception as e2:
+                    print(f"[ERROR] Failed to restore correctors after renewal: {e2}")
+            else:
+                print("[ERROR] Failed to restore correctors on trip — credential "
+                      "renewal failed. MANUALLY VERIFY DEVICE SETTINGS!")
+        except Exception as e:
+            print(f"[ERROR] Failed to restore correctors on trip: {e}")
+        # Read-only confirmation (never raises, no abort_check).
+        self._verify_nominal_restore(restore_devices, restore_values)
+
+    def _escalate_beam_trip_unconfirmed(self, trip_event):
+        """Loss-monitor trip where beam could NOT be confirmed OFF.
+
+        Mirrors the manual _on_beam_disable escalation: marks the beam status
+        UNKNOWN and raises a loud modal so the operator disables the beam by
+        hand. Marshalled onto the Tk main thread via after(0) with the closing
+        guard (worker-thread safe)."""
+        dev = getattr(trip_event, 'device', '?')
+        val = getattr(trip_event, 'value', float('nan'))
+        thr = getattr(trip_event, 'threshold', float('nan'))
+        print("[ERROR] CRITICAL: loss-monitor trip but beam NOT confirmed OFF — "
+              "operator escalation required")
+        if self._closing:
+            return
+        self.after(0, self._set_beam_status, BeamStatus.UNKNOWN)
+
+        def _show_modal():
+            if self._closing:
+                return
+            messagebox.showerror(
+                "Beam Trip NOT Confirmed",
+                f"A loss monitor exceeded its threshold:\n\n"
+                f"    {dev} = {val:.4f}  (threshold {thr:.4f})\n\n"
+                "The automatic beam-disable command was issued, but the beam "
+                "could NOT be confirmed OFF (the SET may have been rejected or "
+                "the status could not be read back).\n\n"
+                "DISABLE THE BEAM MANUALLY NOW and verify the beam state."
+            )
+        self.after(0, _show_modal)
 
     def _compute_scan_step_values(self, configs, nominal_map, step_index, points_per_superperiod, modulated_device=None):
         """Compute device settings for a given scan step."""
@@ -1651,28 +2016,86 @@ class DeviceControlApp(tk.Tk):
         self.beam_interlock.update_config(self.beam_interlock_config)
         self.beam_interlock.reset()
 
-        # Pre-scan beam check
-        if self.beam_interlock_config.enabled:
-            print("[INFO] Beam loss interlock active for this scan")
+        # Freeze an immutable snapshot of the interlock config for the WHOLE
+        # scan. The scan worker reads ONLY this snapshot (enabled/thresholds/
+        # loss list/beam_role/beam_event), never the live self.beam_interlock_config,
+        # so a mid-scan UI edit cannot change what the running scan enforces.
+        frozen_interlock_config = copy.deepcopy(self.beam_interlock_config)
+
+        # Lock the beam buttons / interlock toggle now (#4/#5) so the pre-scan
+        # ACNET preflight and the scan run with the controls disabled.
+        self._update_scan_buttons(is_scanning=True)
+
+        if not frozen_interlock_config.enabled:
+            # No interlock: no ACNET preflight needed, launch directly.
+            self._start_scan_after_preflight(run_config, frozen_interlock_config)
+            return
+
+        # Interlock enabled: run the blocking beam-status + loss-monitor preflight
+        # on a short worker thread (#5, still via the single shared ACNET
+        # executor) and marshal the decision back to the Tk main thread.
+        print("[INFO] Beam loss interlock active for this scan")
+
+        def _preflight():
+            # Require a POSITIVELY-CONFIRMED beam-ON before starting. Unknown
+            # (None) beam state is a preflight FAILURE — retry once.
             beam_on = self.beam_interlock.check_beam_on()
+            if beam_on is None:
+                print("[WARNING] Could not verify beam status — retrying once")
+                beam_on = self.beam_interlock.check_beam_on()
+            loss_readings = {}
+            if beam_on is True:
+                loss_readings = self.beam_interlock.read_loss_monitors()
+            return beam_on, loss_readings
+
+        def _done(result, error):
+            if error is not None:
+                print(f"[ERROR] Pre-scan beam check failed: {error} — cannot start scan.")
+                self._set_beam_status(BeamStatus.UNKNOWN)
+                self.is_scanning = False
+                self._update_scan_buttons(is_scanning=False)
+                return
+            beam_on, loss_readings = result
             if beam_on is False:
                 print("[ERROR] Beam is OFF — cannot start scan. Enable beam first.")
+                self._set_beam_status(BeamStatus.OFF)
                 self.is_scanning = False
+                self._update_scan_buttons(is_scanning=False)
                 return
-            elif beam_on is None:
-                print("[WARNING] Could not verify beam status — proceeding with caution")
-            else:
-                print("[INFO] Pre-scan beam check: beam is ON")
-                self._set_beam_status(BeamStatus.ON)
+            if beam_on is None:
+                print("[ERROR] Beam status UNKNOWN after retry — cannot start scan "
+                      "with the interlock enabled on an unverified beam state.")
+                self._set_beam_status(BeamStatus.UNKNOWN)
+                self.is_scanning = False
+                self._update_scan_buttons(is_scanning=False)
+                return
+
+            print("[INFO] Pre-scan beam check: beam is ON")
+            self._set_beam_status(BeamStatus.ON)
 
             # Pre-scan loss monitor check
-            loss_readings = self.beam_interlock.read_loss_monitors()
             for dev, val in loss_readings.items():
-                thresh = self.beam_interlock_config.loss_monitors.get(dev)
+                thresh = frozen_interlock_config.loss_monitors.get(dev)
                 if thresh is not None and val > thresh:
                     print(f"[ERROR] Pre-scan loss monitor {dev} = {val:.4f} already exceeds threshold {thresh:.4f} — aborting")
                     self.is_scanning = False
+                    self._update_scan_buttons(is_scanning=False)
                     return
+
+            self._start_scan_after_preflight(run_config, frozen_interlock_config)
+
+        self._run_beam_op_async(_preflight, _done)
+
+    def _start_scan_after_preflight(self, run_config, frozen_interlock_config):
+        """Launch the scan worker thread after the (optional) ACNET preflight.
+
+        Runs on the Tk main thread (either directly when the interlock is
+        disabled, or marshalled back from the preflight worker). Captures Tk vars
+        here before spawning the worker thread.
+        """
+        if self._closing:
+            self.is_scanning = False
+            return
 
         self.scan_progressbar.config(maximum=run_config.total_steps, value=0)
 
@@ -1683,10 +2106,17 @@ class DeviceControlApp(tk.Tk):
         metadata = run_config.to_metadata()
         # Pre-capture tkinter var on main thread before starting scan thread
         acnet_event = self.acnet_event.get()
+        use_persistent = self.use_persistent_scan.get()
         if scan_mode == "Simultaneous":
+            # Opt-in persistent advance-on-event engine; default off -> serial path.
+            if use_persistent:
+                print("[INFO] Using the persistent advance-on-event engine "
+                      "(machine-validated ~6x faster, no per-step teardown).")
+            sync_target = (self._persistent_synchronous_scan_loop if use_persistent
+                           else self._synchronous_scan_loop)
             thread = threading.Thread(
-                target=self._synchronous_scan_loop,
-                args=(run_config, metadata, acnet_event),
+                target=sync_target,
+                args=(run_config, metadata, acnet_event, frozen_interlock_config),
                 daemon=True,
             )
         else:  # Sequential
@@ -1695,7 +2125,8 @@ class DeviceControlApp(tk.Tk):
             seq_auto_calc = self.auto_calc_orm.get()
             thread = threading.Thread(
                 target=self._sequential_scan_loop,
-                args=(run_config, metadata, seq_save_dir, seq_auto_calc, acnet_event),
+                args=(run_config, metadata, seq_save_dir, seq_auto_calc,
+                      acnet_event, frozen_interlock_config),
                 daemon=True,
             )
 
@@ -1703,8 +2134,15 @@ class DeviceControlApp(tk.Tk):
         thread.start()
         self._update_scan_buttons(is_scanning=True)
 
-    def _synchronous_scan_loop(self, run_config, metadata, acnet_event=None):
-        """Main scan loop for simultaneous modulation."""
+    def _synchronous_scan_loop(self, run_config, metadata, acnet_event=None,
+                               interlock_config=None):
+        """Main scan loop for simultaneous modulation.
+
+        interlock_config: immutable BeamInterlockConfig snapshot frozen at scan
+        start (see _start_scan). The worker reads ONLY this snapshot for the
+        interlock's enabled/thresholds/loss list/beam_role, never the live
+        self.beam_interlock_config.
+        """
         all_scan_data = []
         devices_to_scan = run_config.device_names
         safety_abort_occurred = False
@@ -1713,6 +2151,14 @@ class DeviceControlApp(tk.Tk):
         user_stopped = False
         restore_devices = None
         restore_values = None
+        # Per-device health accounting (missed/non-finite/rejected-SET). Fresh
+        # for every scan; individual-device problems are recorded here, never abort.
+        self.device_health = {}
+        # Frozen interlock snapshot: fall back to a deepcopy of the live config
+        # if a caller invoked this without one (keeps the worker off live state).
+        if interlock_config is None:
+            interlock_config = copy.deepcopy(self.beam_interlock_config)
+        interlock_enabled = interlock_config.enabled
         try:
             # Clear stale nominals from prior scans before storing new ones
             self.nominal_settings.clear()
@@ -1736,10 +2182,10 @@ class DeviceControlApp(tk.Tk):
             for dev in devices_to_scan:
                 self.nominal_settings.store(dev, nominal_map[dev])
 
-            drf_list, _ = self._build_readback_drf_list(acnet_event=acnet_event)
+            drf_list, scan_drf_devices = self._build_readback_drf_list(acnet_event=acnet_event)
             # Loss monitors ride along in the same event read — avoids a second
-            # blocking read_once_on_event per scan step.
-            loss_drf_list = self._build_loss_monitor_drf_list()
+            # blocking read_once_on_event per scan step. Use the FROZEN config.
+            loss_drf_list = self._build_loss_monitor_drf_list(config=interlock_config)
             n_scan_drf = len(drf_list)
             combined_drf_list = drf_list + loss_drf_list
             nominal_vector = [nominal_map[dev] for dev in devices_to_scan]
@@ -1747,6 +2193,10 @@ class DeviceControlApp(tk.Tk):
             restore_values = nominal_vector
 
             consecutive_timeouts = 0
+            # Loss-monitor misses are tracked INDEPENDENTLY of the BPM slice: a
+            # configured+enabled loss monitor that is missing/non-finite warns
+            # loudly and counts toward LOSS_MONITOR_MAX_CONSECUTIVE_MISSES.
+            loss_consecutive_misses = 0
             renewed = [False]
             for step in range(run_config.total_steps):
                 if self.stop_scan_flag.is_set():
@@ -1762,15 +2212,22 @@ class DeviceControlApp(tk.Tk):
                     run_config.points_per_superperiod,
                 )
 
-                self._acnet_call_with_renewal(
+                set_ok = self._acnet_call_with_renewal(
                     self.scanner.apply_settings_once, devices_to_scan, step_values, run_config.role,
                     abort_check=self.stop_scan_flag.is_set, _renewed=renewed)
+                # apply_settings_once now returns a bool: if the SET was not
+                # positively confirmed (and we are NOT stopping), record the
+                # affected correctors to Device Health and continue — do not
+                # silently treat a rejected SET as applied.
+                if set_ok is False and not self.stop_scan_flag.is_set():
+                    self._record_rejected_correctors(devices_to_scan)
 
-                # Read .SETTING values immediately after applying — captures commanded
-                # setpoints before waiting for the next event-triggered readback.
-                step_settings = self._acnet_call_with_renewal(
-                    self.scanner.get_settings_once, devices_to_scan,
-                    abort_check=self.stop_scan_flag.is_set, _renewed=renewed)
+                # Phase 1: the per-step get_settings_once readback round-trip is
+                # dropped (~30% faster — it was 1 of the 2 remaining DPM opens per
+                # step). The commanded setpoint is known analytically (step_values,
+                # from ScanDeviceConfig.compute_value), so it is recorded directly
+                # as the .SETTING column below. .SETTING is excluded from the ORM,
+                # so the response matrix is unchanged.
 
                 if self.stop_scan_flag.is_set():
                     if not safety_abort_occurred:
@@ -1815,7 +2272,36 @@ class DeviceControlApp(tk.Tk):
                 else:
                     consecutive_timeouts = 0
 
+                # LOSS-MONITOR PRESENCE CHECK (independent of the BPM slice).
+                # A configured+enabled loss monitor that is missing/non-finite
+                # must warn loudly and count toward LOSS_MONITOR_MAX_CONSECUTIVE_MISSES;
+                # never a silent "OK". This runs even when the BPM slice is empty.
+                if interlock_enabled:
+                    missing_loss = self._missing_loss_monitors(
+                        loss_data_from_step, interlock_config)
+                    if missing_loss:
+                        loss_consecutive_misses += 1
+                        for dev in missing_loss:
+                            self._record_device_problem(dev, 'missed')
+                        print(f"[WARNING] Loss monitor(s) missing/non-finite this "
+                              f"step: {', '.join(missing_loss)} "
+                              f"({loss_consecutive_misses}/{LOSS_MONITOR_MAX_CONSECUTIVE_MISSES})")
+                        if loss_consecutive_misses >= LOSS_MONITOR_MAX_CONSECUTIVE_MISSES:
+                            print(f"[ERROR] {LOSS_MONITOR_MAX_CONSECUTIVE_MISSES} consecutive "
+                                  f"loss-monitor misses — cannot guarantee the loss interlock; "
+                                  f"auto-aborting scan")
+                            scan_error = True
+                            safety_abort_occurred = True
+                            self.stop_scan_flag.set()
+                            break
+                    else:
+                        loss_consecutive_misses = 0
+
                 if data_from_step:
+                    # Per-device exclude-and-report accounting BEFORE filtering:
+                    # absent/None slots -> 'missed'; finite -> 'last_seen'.
+                    self._account_bpm_step_health(
+                        data_from_step, scan_drf_devices, [])
                     # Filter out None values (from timeouts) and add to scan data
                     valid_data = [item for item in data_from_step if item is not None]
                     if valid_data:
@@ -1826,18 +2312,20 @@ class DeviceControlApp(tk.Tk):
                         for item in valid_data:
                             item['stamp'] = common_stamp
 
-                        # Merge .SETTING values into scan data at the same timestamp
-                        if step_settings:
-                            for dev, val in zip(devices_to_scan, step_settings):
-                                if val is not None:
-                                    try:
-                                        valid_data.append({
-                                            'stamp': common_stamp,
-                                            'name': f"{dev}.SETTING",
-                                            'data': float(val),
-                                        })
-                                    except (TypeError, ValueError):
-                                        pass
+                        # Merge the analytically COMMANDED setpoint as the .SETTING
+                        # column (Phase 1). step_values is the exact commanded
+                        # vector (ScanDeviceConfig.compute_value), aligned with
+                        # devices_to_scan — the same vector just sent via
+                        # apply_settings_once. Excluded from the ORM.
+                        for dev, val in zip(devices_to_scan, step_values):
+                            try:
+                                valid_data.append({
+                                    'stamp': common_stamp,
+                                    'name': f"{dev}.SETTING",
+                                    'data': float(val),
+                                })
+                            except (TypeError, ValueError):
+                                pass
 
                         all_scan_data.extend(valid_data)
                         self.data_queue.put(valid_data)
@@ -1845,7 +2333,14 @@ class DeviceControlApp(tk.Tk):
                         # SAFETY CHECK: Monitor reading devices for threshold violations
                         if self.safety_config.enabled and self.safety_baselines_measured:
                             try:
-                                violations = self.safety_monitor.check_batch(valid_data)
+                                # Collect non-finite device names so they are
+                                # EXCLUDED from analysis but recorded to Device
+                                # Health (they never abort on their own).
+                                nonfinite_devices = []
+                                violations = self.safety_monitor.check_batch(
+                                    valid_data, nonfinite_out=nonfinite_devices)
+                                for dev in nonfinite_devices:
+                                    self._record_device_problem(dev, 'nonfinite')
                                 abort_violations = [v for v in violations if v.violation_type == ViolationType.ABORT]
 
                                 if abort_violations:
@@ -1866,14 +2361,25 @@ class DeviceControlApp(tk.Tk):
                                 self.stop_scan_flag.set()
                                 break
 
-                        # BEAM LOSS INTERLOCK CHECK
-                        if self.beam_interlock_config.enabled:
-                            trip = self._check_loss_monitor_data(loss_data_from_step)
+                        # BEAM LOSS INTERLOCK CHECK (frozen config)
+                        if interlock_enabled:
+                            trip = self._check_loss_monitor_data(
+                                loss_data_from_step, config=interlock_config)
                             if trip is not None:
-                                beam_role = self.beam_interlock.get_effective_role(run_config.role)
-                                self.beam_interlock.trip_beam(trip, beam_role)
-                                if not self._closing:
-                                    self.after(0, self._set_beam_status, BeamStatus.OFF)
+                                # #1: RESTORE correctors to nominal FIRST, then
+                                # trip the beam. Restore runs to completion with
+                                # NO abort_check (safety-critical).
+                                self._restore_correctors_on_trip(
+                                    restore_devices, restore_values, run_config.role)
+                                beam_role = interlock_config.beam_role or run_config.role
+                                beam_off = self.beam_interlock.trip_beam(trip, beam_role)
+                                if beam_off:
+                                    if not self._closing:
+                                        self.after(0, self._set_beam_status, BeamStatus.OFF)
+                                else:
+                                    # Not confirmed OFF — escalate exactly like the
+                                    # manual _on_beam_disable path (modal + UNKNOWN).
+                                    self._escalate_beam_trip_unconfirmed(trip)
                                 safety_abort_occurred = True
                                 scan_error = True
                                 self.stop_scan_flag.set()
@@ -1912,8 +2418,241 @@ class DeviceControlApp(tk.Tk):
                 if not self._closing:
                     self.after(0, self._update_scan_buttons, False)
 
-    def _sequential_scan_loop(self, run_config, metadata, save_dir=None, auto_calc=None, acnet_event=None):
-        """Scan loop that modulates one device at a time."""
+    def _persistent_synchronous_scan_loop(self, run_config, metadata, acnet_event=None,
+                                          interlock_config=None):
+        """OPT-IN persistent advance-on-event variant of _synchronous_scan_loop.
+
+        Same preflight, safety contract, and teardown as the serial loop, but the
+        per-step apply+read (two fresh DPMContexts per step, ~1.2 s) is replaced by
+        ONE persistent settings context + ONE persistent read subscription driven by
+        AcnetScanner.run_advance_on_event_scan (machine-validated 2026-06-04: ~6x
+        faster, 100/100 complete events on 71 devices, no stall). The per-step body
+        runs inside on_event() and reuses the SAME helper methods as the serial loop
+        (no divergence of the safety logic). The serial _synchronous_scan_loop is
+        unchanged and remains the default; this path is reached only when the
+        'Persistent (advance-on-event)' option is on.
+
+        Behaviour differences vs the serial loop (validate on the machine):
+          * No per-step SET-confirmation (engine fires the SET; the corrector
+            READBACK in each snapshot is the confirmation). _record_rejected_
+            correctors is therefore not used here.
+          * No explicit retry-once on an empty read: a total read stall surfaces as
+            an all-None snapshot which still feeds the consecutive-timeout abort.
+          * On a loss trip the engine is stopped first, THEN correctors are restored
+            and the beam tripped (correct order preserved; the single executor must
+            be free for those serial ops, so they cannot run inside the callback).
+        """
+        all_scan_data = []
+        devices_to_scan = run_config.device_names
+        safety_abort_occurred = False
+        scan_started = False
+        scan_error = False
+        user_stopped = False
+        restore_devices = None
+        restore_values = None
+        self.device_health = {}
+        if interlock_config is None:
+            interlock_config = copy.deepcopy(self.beam_interlock_config)
+        interlock_enabled = interlock_config.enabled
+        # Cross-step state held in a dict so the on_event closure can mutate it.
+        st = {'consecutive_timeouts': 0, 'loss_consecutive_misses': 0,
+              'safety_abort': False, 'scan_error': False, 'pending_trip': None,
+              'user_stopped': False}
+        try:
+            self.nominal_settings.clear()
+            try:
+                nominals = self._acnet_call_with_renewal(
+                    self.scanner.get_settings_once, devices_to_scan)
+            except CredentialExpiredError:
+                print("[ERROR] Cannot read device nominals — Kerberos ticket expired.")
+                return
+            nominal_map, fallback_devices = self._build_nominal_map(devices_to_scan, nominals)
+            if fallback_devices:
+                print(f"[ERROR] Could not read nominals for: {', '.join(sorted(set(fallback_devices)))}")
+                print(f"[ERROR] Aborting scan — cannot safely modulate devices with unknown nominals.")
+                return
+            scan_started = True
+            for dev in devices_to_scan:
+                self.nominal_settings.store(dev, nominal_map[dev])
+
+            drf_list, scan_drf_devices = self._build_readback_drf_list(acnet_event=acnet_event)
+            loss_drf_list = self._build_loss_monitor_drf_list(config=interlock_config)
+            n_scan_drf = len(drf_list)
+            combined_drf_list = drf_list + loss_drf_list
+            nominal_vector = [nominal_map[dev] for dev in devices_to_scan]
+            restore_devices = devices_to_scan
+            restore_values = nominal_vector
+            total_steps = run_config.total_steps
+
+            def _step_values(step):
+                return self._compute_scan_step_values(
+                    run_config.devices, nominal_map, step, run_config.points_per_superperiod)
+
+            def on_event(idx, snapshot, complete):
+                """Per-step body — mirrors _synchronous_scan_loop. Returns the next
+                setpoint vector, or None to stop the engine."""
+                if self.stop_scan_flag.is_set():
+                    st['user_stopped'] = not st['safety_abort']
+                    return None
+                data_from_step = snapshot[:n_scan_drf]
+                loss_data_from_step = snapshot[n_scan_drf:]
+                step_values = _step_values(idx)
+
+                # Consecutive all-None (total read stall) -> same abort as serial.
+                if data_from_step and all(item is None for item in data_from_step):
+                    st['consecutive_timeouts'] += 1
+                    print(f"[WARNING] Scan step {idx}: no data received "
+                          f"(timeout {st['consecutive_timeouts']}/{ACNET_MAX_CONSECUTIVE_TIMEOUTS})")
+                    if st['consecutive_timeouts'] >= ACNET_MAX_CONSECUTIVE_TIMEOUTS:
+                        print(f"[ERROR] {ACNET_MAX_CONSECUTIVE_TIMEOUTS} consecutive timeouts — "
+                              f"auto-aborting scan (beam may be off or ACNET connection lost)")
+                        st['scan_error'] = True
+                        self.stop_scan_flag.set()
+                        return None
+                else:
+                    st['consecutive_timeouts'] = 0
+
+                # Loss-monitor presence check (independent of the BPM slice).
+                if interlock_enabled:
+                    missing_loss = self._missing_loss_monitors(loss_data_from_step, interlock_config)
+                    if missing_loss:
+                        st['loss_consecutive_misses'] += 1
+                        for dev in missing_loss:
+                            self._record_device_problem(dev, 'missed')
+                        print(f"[WARNING] Loss monitor(s) missing/non-finite this step: "
+                              f"{', '.join(missing_loss)} "
+                              f"({st['loss_consecutive_misses']}/{LOSS_MONITOR_MAX_CONSECUTIVE_MISSES})")
+                        if st['loss_consecutive_misses'] >= LOSS_MONITOR_MAX_CONSECUTIVE_MISSES:
+                            print(f"[ERROR] {LOSS_MONITOR_MAX_CONSECUTIVE_MISSES} consecutive loss-monitor "
+                                  f"misses — cannot guarantee the loss interlock; auto-aborting scan")
+                            st['scan_error'] = True
+                            st['safety_abort'] = True
+                            self.stop_scan_flag.set()
+                            return None
+                    else:
+                        st['loss_consecutive_misses'] = 0
+
+                if data_from_step:
+                    self._account_bpm_step_health(data_from_step, scan_drf_devices, [])
+                    valid_data = [item for item in data_from_step if item is not None]
+                    if valid_data:
+                        common_stamp = valid_data[0]['stamp']
+                        for item in valid_data:
+                            item['stamp'] = common_stamp
+                        # Analytically COMMANDED setpoint as .SETTING (excluded from ORM).
+                        for dev, val in zip(devices_to_scan, step_values):
+                            try:
+                                valid_data.append({'stamp': common_stamp,
+                                                   'name': f"{dev}.SETTING", 'data': float(val)})
+                            except (TypeError, ValueError):
+                                pass
+                        all_scan_data.extend(valid_data)
+                        self.data_queue.put(valid_data)
+
+                        if self.safety_config.enabled and self.safety_baselines_measured:
+                            try:
+                                nonfinite_devices = []
+                                violations = self.safety_monitor.check_batch(
+                                    valid_data, nonfinite_out=nonfinite_devices)
+                                for dev in nonfinite_devices:
+                                    self._record_device_problem(dev, 'nonfinite')
+                                abort_violations = [v for v in violations
+                                                    if v.violation_type == ViolationType.ABORT]
+                                if abort_violations:
+                                    print("[ERROR] Safety abort triggered - stopping scan")
+                                    print("[INFO] Abort data point HAS been saved to scan data")
+                                    st['safety_abort'] = True
+                                    st['scan_error'] = True
+                                    self._trigger_safety_abort(abort_violations)
+                                    self.stop_scan_flag.set()
+                                    return None
+                            except Exception as e:
+                                print(f"[ERROR] Safety check failed — aborting scan: {e}")
+                                st['scan_error'] = True
+                                st['safety_abort'] = True
+                                self.stop_scan_flag.set()
+                                return None
+
+                        if interlock_enabled:
+                            trip = self._check_loss_monitor_data(loss_data_from_step, config=interlock_config)
+                            if trip is not None:
+                                # Restore + beam-trip cannot run inside the engine
+                                # coroutine (the single executor is busy). Record the
+                                # trip and STOP; the post-engine handler restores
+                                # correctors BEFORE tripping the beam (serial loop order).
+                                st['pending_trip'] = trip
+                                st['safety_abort'] = True
+                                st['scan_error'] = True
+                                self.stop_scan_flag.set()
+                                return None
+
+                if not self._closing:
+                    self.after(0, self.scan_progressbar.step)
+                if idx + 1 >= total_steps:
+                    return None
+                return _step_values(idx + 1)
+
+            # Drive the persistent engine. per_event_tmo > @e,52's ~730 ms bursty gap
+            # AND long enough that a beam-gated pause is not falsely seen as a stall;
+            # 5 consecutive stalls still auto-abort (~25 s), like the serial loop.
+            self.scanner.run_advance_on_event_scan(
+                combined_drf_list, devices_to_scan, _step_values(0), run_config.role,
+                on_event, abort_check=self.stop_scan_flag.is_set, per_event_tmo=5.0)
+
+            safety_abort_occurred = st['safety_abort']
+            scan_error = st['scan_error']
+            user_stopped = st['user_stopped']
+
+            # Loss trip: engine has stopped, so the executor is free for these serial
+            # ops. Restore correctors FIRST, then trip the beam (serial loop order).
+            if st['pending_trip'] is not None:
+                trip = st['pending_trip']
+                self._restore_correctors_on_trip(restore_devices, restore_values, run_config.role)
+                beam_role = interlock_config.beam_role or run_config.role
+                beam_off = self.beam_interlock.trip_beam(trip, beam_role)
+                if beam_off:
+                    if not self._closing:
+                        self.after(0, self._set_beam_status, BeamStatus.OFF)
+                else:
+                    self._escalate_beam_trip_unconfirmed(trip)
+                print(f"[ERROR] Beam tripped — scan aborted: {trip}")
+        except Exception as e:
+            print(f"[ERROR] An error occurred during the scan: {e}")
+            scan_error = True
+        finally:
+            if scan_started:
+                if restore_devices and restore_values:
+                    try:
+                        self.scanner.apply_settings_once(restore_devices, restore_values, run_config.role)
+                    except CredentialExpiredError:
+                        print("[WARNING] Credential expired during nominal restore — attempting renewal...")
+                        if self._renew_kerberos_ticket():
+                            try:
+                                self.scanner.apply_settings_once(restore_devices, restore_values, run_config.role)
+                                print("[SUCCESS] Nominal settings restored after credential renewal.")
+                            except Exception as e2:
+                                print(f"[ERROR] Failed to restore nominal settings after renewal: {e2}")
+                        else:
+                            print("[ERROR] Failed to restore nominal settings — credential renewal failed. "
+                                  "MANUALLY VERIFY DEVICE SETTINGS!")
+                    except Exception as e:
+                        print(f"[ERROR] Failed to restore nominal settings: {e}")
+                    self._verify_nominal_restore(restore_devices, restore_values)
+                if not self._closing:
+                    self.after(0, self._on_scan_complete, all_scan_data, metadata, scan_error, user_stopped)
+            else:
+                self.is_scanning = False
+                if not self._closing:
+                    self.after(0, self._update_scan_buttons, False)
+
+    def _sequential_scan_loop(self, run_config, metadata, save_dir=None, auto_calc=None, acnet_event=None,
+                              interlock_config=None):
+        """Scan loop that modulates one device at a time.
+
+        interlock_config: immutable BeamInterlockConfig snapshot frozen at scan
+        start (see _start_scan). The worker reads ONLY this snapshot for the
+        interlock, never the live self.beam_interlock_config.
+        """
         devices_to_scan = run_config.device_names
         total_steps = run_config.total_steps
         safety_abort_occurred = False
@@ -1922,6 +2661,12 @@ class DeviceControlApp(tk.Tk):
         user_stopped = False
         restore_devices = None
         restore_values = None
+        # Per-device health accounting (missed/non-finite/rejected-SET). Fresh
+        # for every scan; individual-device problems are recorded here, never abort.
+        self.device_health = {}
+        if interlock_config is None:
+            interlock_config = copy.deepcopy(self.beam_interlock_config)
+        interlock_enabled = interlock_config.enabled
         try:
             # Clear stale nominals from prior scans before storing new ones
             self.nominal_settings.clear()
@@ -1945,10 +2690,10 @@ class DeviceControlApp(tk.Tk):
             for dev in devices_to_scan:
                 self.nominal_settings.store(dev, nominal_map[dev])
 
-            drf_list, _ = self._build_readback_drf_list(acnet_event=acnet_event)
+            drf_list, scan_drf_devices = self._build_readback_drf_list(acnet_event=acnet_event)
             # Loss monitors ride along in the same event read — avoids a second
-            # blocking read_once_on_event per scan step.
-            loss_drf_list = self._build_loss_monitor_drf_list()
+            # blocking read_once_on_event per scan step. Use the FROZEN config.
+            loss_drf_list = self._build_loss_monitor_drf_list(config=interlock_config)
             n_scan_drf = len(drf_list)
             combined_drf_list = drf_list + loss_drf_list
             nominal_vector = [nominal_map[dev] for dev in devices_to_scan]
@@ -1968,6 +2713,8 @@ class DeviceControlApp(tk.Tk):
                 single_scan_data = []
 
                 consecutive_timeouts = 0
+                # Loss-monitor misses tracked INDEPENDENTLY of the BPM slice.
+                loss_consecutive_misses = 0
                 renewed = [False]
                 for step in range(total_steps):
                     if self.stop_scan_flag.is_set():
@@ -1981,15 +2728,17 @@ class DeviceControlApp(tk.Tk):
                         modulated_device=config.device,
                     )
 
-                    self._acnet_call_with_renewal(
+                    set_ok = self._acnet_call_with_renewal(
                         self.scanner.apply_settings_once, devices_to_scan, step_values, run_config.role,
                         abort_check=self.stop_scan_flag.is_set, _renewed=renewed)
+                    # Record rejected correctors (#3) — continue, do not abort.
+                    if set_ok is False and not self.stop_scan_flag.is_set():
+                        self._record_rejected_correctors(devices_to_scan)
 
-                    # Read .SETTING values immediately after applying — captures commanded
-                    # setpoints before waiting for the next event-triggered readback.
-                    step_settings = self._acnet_call_with_renewal(
-                        self.scanner.get_settings_once, devices_to_scan,
-                        abort_check=self.stop_scan_flag.is_set, _renewed=renewed)
+                    # Phase 1: dropped the per-step get_settings_once round-trip;
+                    # the commanded setpoint (step_values, ScanDeviceConfig.
+                    # compute_value) is recorded directly as .SETTING below.
+                    # Excluded from the ORM, so the response matrix is unchanged.
 
                     if self.stop_scan_flag.is_set():
                         break
@@ -2028,7 +2777,36 @@ class DeviceControlApp(tk.Tk):
                     else:
                         consecutive_timeouts = 0
 
+                    # LOSS-MONITOR PRESENCE CHECK (independent of the BPM slice).
+                    # A configured+enabled loss monitor that is missing/non-finite
+                    # warns loudly and counts toward LOSS_MONITOR_MAX_CONSECUTIVE_MISSES;
+                    # never a silent "OK". Runs even when the BPM slice is empty.
+                    if interlock_enabled:
+                        missing_loss = self._missing_loss_monitors(
+                            loss_data_from_step, interlock_config)
+                        if missing_loss:
+                            loss_consecutive_misses += 1
+                            for dev in missing_loss:
+                                self._record_device_problem(dev, 'missed')
+                            print(f"[WARNING] Loss monitor(s) missing/non-finite this "
+                                  f"step: {', '.join(missing_loss)} "
+                                  f"({loss_consecutive_misses}/{LOSS_MONITOR_MAX_CONSECUTIVE_MISSES})")
+                            if loss_consecutive_misses >= LOSS_MONITOR_MAX_CONSECUTIVE_MISSES:
+                                print(f"[ERROR] {LOSS_MONITOR_MAX_CONSECUTIVE_MISSES} consecutive "
+                                      f"loss-monitor misses — cannot guarantee the loss interlock; "
+                                      f"auto-aborting scan")
+                                scan_error = True
+                                safety_abort_occurred = True
+                                self.stop_scan_flag.set()
+                                break
+                        else:
+                            loss_consecutive_misses = 0
+
                     if data_from_step:
+                        # Per-device exclude-and-report accounting BEFORE filtering:
+                        # absent/None slots -> 'missed'; finite -> 'last_seen'.
+                        self._account_bpm_step_health(
+                            data_from_step, scan_drf_devices, [])
                         # Filter out None values (from timeouts) and add to scan data
                         valid_data = [item for item in data_from_step if item is not None]
                         if valid_data:
@@ -2039,18 +2817,18 @@ class DeviceControlApp(tk.Tk):
                             for item in valid_data:
                                 item['stamp'] = common_stamp
 
-                            # Merge .SETTING values into scan data at the same timestamp
-                            if step_settings:
-                                for dev, val in zip(devices_to_scan, step_settings):
-                                    if val is not None:
-                                        try:
-                                            valid_data.append({
-                                                'stamp': common_stamp,
-                                                'name': f"{dev}.SETTING",
-                                                'data': float(val),
-                                            })
-                                        except (TypeError, ValueError):
-                                            pass
+                            # Merge the analytically COMMANDED setpoint as the
+                            # .SETTING column (Phase 1). step_values is the exact
+                            # commanded vector aligned with devices_to_scan.
+                            for dev, val in zip(devices_to_scan, step_values):
+                                try:
+                                    valid_data.append({
+                                        'stamp': common_stamp,
+                                        'name': f"{dev}.SETTING",
+                                        'data': float(val),
+                                    })
+                                except (TypeError, ValueError):
+                                    pass
 
                             single_scan_data.extend(valid_data)
                             self.data_queue.put(valid_data)
@@ -2058,7 +2836,19 @@ class DeviceControlApp(tk.Tk):
                             # SAFETY CHECK: Monitor reading devices for threshold violations
                             if self.safety_config.enabled and self.safety_baselines_measured:
                                 try:
-                                    violations = self.safety_monitor.check_batch(valid_data)
+                                    # Collect non-finite device names so the safety
+                                    # monitor EXCLUDES them from the mean (they never
+                                    # poison the buffer and never abort on their own).
+                                    # device_health recording of non-finite is done
+                                    # once in _account_bpm_step_health from raw data,
+                                    # so we do not re-record here (avoids double count).
+                                    nonfinite_devices = []
+                                    violations = self.safety_monitor.check_batch(
+                                        valid_data, nonfinite_out=nonfinite_devices)
+                                    if nonfinite_devices:
+                                        print(f"[WARNING] Safety monitor flagged "
+                                              f"non-finite readings (excluded from "
+                                              f"analysis): {', '.join(nonfinite_devices)}")
                                     abort_violations = [v for v in violations if v.violation_type == ViolationType.ABORT]
 
                                     if abort_violations:
@@ -2079,14 +2869,22 @@ class DeviceControlApp(tk.Tk):
                                     self.stop_scan_flag.set()
                                     break
 
-                            # BEAM LOSS INTERLOCK CHECK
-                            if self.beam_interlock_config.enabled:
-                                trip = self._check_loss_monitor_data(loss_data_from_step)
+                            # BEAM LOSS INTERLOCK CHECK (frozen config)
+                            if interlock_enabled:
+                                trip = self._check_loss_monitor_data(
+                                    loss_data_from_step, config=interlock_config)
                                 if trip is not None:
-                                    beam_role = self.beam_interlock.get_effective_role(run_config.role)
-                                    self.beam_interlock.trip_beam(trip, beam_role)
-                                    if not self._closing:
-                                        self.after(0, self._set_beam_status, BeamStatus.OFF)
+                                    # #1: RESTORE correctors to nominal FIRST, then
+                                    # trip beam; restore runs to completion, no abort_check.
+                                    self._restore_correctors_on_trip(
+                                        restore_devices, restore_values, run_config.role)
+                                    beam_role = interlock_config.beam_role or run_config.role
+                                    beam_off = self.beam_interlock.trip_beam(trip, beam_role)
+                                    if beam_off:
+                                        if not self._closing:
+                                            self.after(0, self._set_beam_status, BeamStatus.OFF)
+                                    else:
+                                        self._escalate_beam_trip_unconfirmed(trip)
                                     safety_abort_occurred = True
                                     scan_error = True
                                     self.stop_scan_flag.set()
@@ -2173,15 +2971,16 @@ class DeviceControlApp(tk.Tk):
             try:
                 pivot_df = df.pivot_table(index='stamp', columns='name', values='data')
                 pivot_df.sort_index(inplace=True)
-                pivot_df.to_csv(data_filename, index_label='Timestamp')
+                atomic_to_csv(pivot_df, data_filename, index_label='Timestamp')
                 if partial:
                     print(f"[INFO] Partial sequential scan data for {device_name} saved ({len(scan_data)} points) to:\n{data_filename}")
                 else:
                     print(f"[SUCCESS] Sequential scan data for {device_name} saved to:\n{data_filename}")
                 self.last_analysis_source = data_filename
 
-                with open(meta_filename, 'w') as f:
-                    json.dump(scan_params, f, indent=4)
+                atomic_write_text(meta_filename,
+                                  json.dumps(scan_params, indent=4),
+                                  encoding='utf-8')
                 print(f"[SUCCESS] Metadata for {device_name} saved to:\n{meta_filename}")
 
                 # Auto-calculate and save ORM on the main thread (skip for partial scans)
@@ -2233,6 +3032,10 @@ class DeviceControlApp(tk.Tk):
         self.scan_progressbar.config(value=0)
         self._update_scan_buttons(is_scanning=False)
 
+        # Render per-device health accumulated by the scan worker (#4). The
+        # worker has finished by the time this main-thread callback runs.
+        self._populate_device_health()
+
         # Save and analyze data for simultaneous scans
         if self.scan_mode.get() == "Simultaneous" and all_scan_data:
             timestr = datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -2248,14 +3051,15 @@ class DeviceControlApp(tk.Tk):
                 try:
                     pivot_df = df.pivot_table(index='stamp', columns='name', values='data')
                     pivot_df.sort_index(inplace=True)
-                    pivot_df.to_csv(data_filename, index_label='Timestamp')
+                    atomic_to_csv(pivot_df, data_filename, index_label='Timestamp')
                     if is_partial:
                         print(f"[INFO] Partial scan data saved ({len(all_scan_data)} points) to:\n{data_filename}")
                     else:
                         print(f"[SUCCESS] Scan data automatically saved to:\n{data_filename}")
 
-                    with open(meta_filename, 'w') as f:
-                        json.dump(scan_params, f, indent=4)
+                    atomic_write_text(meta_filename,
+                                      json.dumps(scan_params, indent=4),
+                                      encoding='utf-8')
                     print(f"[SUCCESS] Scan metadata saved to:\n{meta_filename}")
 
                     # Auto-analyze only for complete scans
@@ -2289,6 +3093,19 @@ class DeviceControlApp(tk.Tk):
         self.stop_scan_button.config(state="normal" if is_scanning else "disabled")
         self.reading_status_label.config(text="Status: Scanning..." if is_scanning else "Status: Idle")
         self.start_stop_button.config(state="disabled" if is_scanning else "normal")
+
+        # Disable the beam ON/OFF/Refresh buttons and the interlock-enable toggle
+        # while a scan is running (#4/#5). These ACNET handlers must not be fired
+        # mid-scan; they re-enable on completion.
+        beam_state = "disabled" if is_scanning else "normal"
+        for attr in ("beam_enable_button", "beam_disable_button",
+                     "beam_refresh_button", "interlock_enabled_check"):
+            widget = getattr(self, attr, None)
+            if widget is not None:
+                try:
+                    widget.config(state=beam_state)
+                except tk.TclError:
+                    pass
 
     def _toggle_reading(self):
         """Starts or stops the data reading thread for live monitoring (non-scan)."""
@@ -2478,7 +3295,7 @@ class DeviceControlApp(tk.Tk):
                     df = pd.DataFrame.from_records(all_data_list)
                     pivot_df = df.pivot_table(index='stamp', columns='name', values='data')
                     pivot_df.sort_index(inplace=True)
-                    pivot_df.to_csv(filepath, index_label='Timestamp')
+                    atomic_to_csv(pivot_df, filepath, index_label='Timestamp')
                     self.last_analysis_source = filepath
 
                     print(f"[SUCCESS] All acquired data saved to {filepath}")
@@ -2508,7 +3325,7 @@ class DeviceControlApp(tk.Tk):
                     self.fft_device_listbox.insert(tk.END, col)
             
                 # Also try to load the metadata file
-                meta_path = filepath.replace('.csv', '_meta.json')
+                meta_path = self._meta_path_for(filepath)
                 if os.path.exists(meta_path):
                     with open(meta_path, 'r') as f:
                         self.fft_scan_params = json.load(f)
@@ -3164,8 +3981,10 @@ class DeviceControlApp(tk.Tk):
                 ec = corrector_info[s_dev]['noise']
 
                 if corr_amp > 0:
-                    error_term = (eb ** 2) / (corr_amp ** 2)
-                    error_term += ((bpm_amp ** 2) / (corr_amp ** 4)) * (ec ** 2)
+                    # Error propagation per the manual (eq:errorprop): each term
+                    # carries a 1/2 factor (the FFT amplitude estimate variance).
+                    error_term = (eb ** 2) / (2.0 * corr_amp ** 2)
+                    error_term += ((bpm_amp ** 2) / (2.0 * corr_amp ** 4)) * (ec ** 2)
                     self.response_error_matrix[r_idx, c_idx] = float(np.sqrt(error_term)) if error_term > 0 else 0.0
 
         # DIAGNOSTIC: Print error matrix statistics
@@ -3567,7 +4386,7 @@ class DeviceControlApp(tk.Tk):
 
                     plane_filename = f"{base_stem}_{plane.lower()}.csv"
                     plane_path = output_dir / plane_filename
-                    df.to_csv(plane_path)
+                    atomic_to_csv(df, plane_path)
                     saved_files.append(plane_path)
 
                     # Export the error matrix for this plane if available
@@ -3578,7 +4397,7 @@ class DeviceControlApp(tk.Tk):
                             df_err.index.name = "Reading Device"
                             error_filename = f"{base_stem}_{plane.lower()}_error.csv"
                             error_path = output_dir / error_filename
-                            df_err.to_csv(error_path)
+                            atomic_to_csv(df_err, error_path)
                             saved_files.append(error_path)
 
                 if saved_files:
@@ -3626,7 +4445,7 @@ class DeviceControlApp(tk.Tk):
 
                 plane_filename = f"{base_stem}_{plane.lower()}.csv"
                 plane_path = output_dir / plane_filename
-                df.to_csv(plane_path)
+                atomic_to_csv(df, plane_path)
                 saved_files.append(plane_path)
 
                 if self.response_error_matrix is not None:
@@ -3636,7 +4455,7 @@ class DeviceControlApp(tk.Tk):
                         df_err.index.name = "Reading Device"
                         error_filename = f"{base_stem}_{plane.lower()}_error.csv"
                         error_path = output_dir / error_filename
-                        df_err.to_csv(error_path)
+                        atomic_to_csv(df_err, error_path)
                         saved_files.append(error_path)
 
             if saved_files:
@@ -3724,8 +4543,8 @@ class DeviceControlApp(tk.Tk):
             scan_setup = [cfg.to_setup_dict() for cfg in configs]
 
             try:
-                with open(filepath, 'w') as f:
-                    json.dump(scan_setup, f, indent=4)
+                atomic_write_text(filepath, json.dumps(scan_setup, indent=4),
+                                  encoding='utf-8')
                 print(f"[SUCCESS] Scan setup saved to {filepath}")
             except Exception as e:
                 print(f"[ERROR] Failed to save scan setup: {e}")
@@ -4022,8 +4841,8 @@ class DeviceControlApp(tk.Tk):
 
         try:
             config_dict = self.safety_config.to_dict()
-            with open(filepath, 'w') as f:
-                json.dump(config_dict, f, indent=2)
+            atomic_write_text(filepath, json.dumps(config_dict, indent=2),
+                              encoding='utf-8')
             print(f"[SUCCESS] Safety configuration saved to: {filepath}")
             messagebox.showinfo("Success", "Safety configuration saved successfully.")
         except Exception as e:
@@ -4174,9 +4993,10 @@ class DeviceControlApp(tk.Tk):
 
             log_data['events'].append(event)
 
-            # Write back
-            with open(log_file, 'w') as f:
-                json.dump(log_data, f, indent=2)
+            # Write back atomically (temp file + os.replace) so a crash mid-write
+            # never leaves a truncated safety log.
+            atomic_write_text(log_file, json.dumps(log_data, indent=2),
+                              encoding='utf-8')
 
         except Exception as e:
             print(f"[ERROR] Failed to log safety event: {e}")
@@ -4410,15 +5230,17 @@ class DeviceControlApp(tk.Tk):
                 ]
             }
 
-            # Save to file
-            with open(filepath, 'w') as f:
-                json.dump(abort_data, f, indent=2)
+            # Save to file atomically
+            atomic_write_text(filepath, json.dumps(abort_data, indent=2),
+                              encoding='utf-8')
 
             # Also save human-readable text version
             text_filename = f"ABORT_{timestamp.strftime('%Y%m%d_%H%M%S')}.txt"
             text_filepath = abort_log_dir / text_filename
 
-            with open(text_filepath, 'w') as f:
+            # Build the human-readable report in a buffer, then write atomically.
+            f = io.StringIO()
+            if True:
                 f.write("=" * 80 + "\n")
                 f.write("SAFETY ABORT LOG\n")
                 f.write("=" * 80 + "\n\n")
@@ -4489,6 +5311,8 @@ class DeviceControlApp(tk.Tk):
                 f.write("\n" + "=" * 80 + "\n")
                 f.write(f"JSON data saved to: {filename}\n")
                 f.write("=" * 80 + "\n")
+
+            atomic_write_text(text_filepath, f.getvalue(), encoding='utf-8')
 
             print(f"[SUCCESS] Detailed abort log saved:")
             print(f"          JSON: {filepath.absolute()}")
@@ -4624,15 +5448,55 @@ class DeviceControlApp(tk.Tk):
         self.beam_interlock.update_config(config)
         return self.beam_interlock.get_effective_role(self.setting_role.get())
 
+    def _run_beam_op_async(self, work, on_done):
+        """Run a blocking ACNET beam op off the Tk main thread (#5).
+
+        `work` is a 0-arg callable executed on a short daemon worker thread. It
+        invokes scanner/interlock methods which still funnel through the SINGLE
+        shared ACNET executor — this helper does NOT create an executor or call
+        acsys.run_client itself. The result (or the exception) is marshalled back
+        to the Tk main thread via self.after(0, ...) and passed to
+        on_done(result, error) there, guarded by self._closing.
+        """
+        def _worker():
+            result = None
+            error = None
+            try:
+                result = work()
+            except Exception as e:  # surface to the UI rather than crash the thread
+                error = e
+            if self._closing:
+                return
+            try:
+                self.after(0, _deliver, result, error)
+            except RuntimeError:
+                pass  # interpreter/Tk shutting down
+
+        def _deliver(result, error):
+            if self._closing:
+                return
+            on_done(result, error)
+
+        threading.Thread(target=_worker, daemon=True).start()
+
     def _refresh_beam_status(self):
-        """Re-read beam status from ACNET and update indicator."""
+        """Re-read beam status from ACNET and update indicator (off-thread)."""
+        # Build/snapshot config on the Tk main thread, then read status on a
+        # worker so the GUI never blocks on ACNET.
         self.beam_interlock_config = self._build_beam_interlock_config()
         self.beam_interlock.update_config(self.beam_interlock_config)
-        beam_on = self.beam_interlock.check_beam_on()
-        self._set_beam_status(
-            BeamStatus.ON if beam_on is True
-            else BeamStatus.OFF if beam_on is False
-            else BeamStatus.UNKNOWN)
+
+        def _done(beam_on, error):
+            if error is not None:
+                print(f"[WARNING] Failed to refresh beam status: {error}")
+                self._set_beam_status(BeamStatus.UNKNOWN)
+                return
+            self._set_beam_status(
+                BeamStatus.ON if beam_on is True
+                else BeamStatus.OFF if beam_on is False
+                else BeamStatus.UNKNOWN)
+
+        self._run_beam_op_async(self.beam_interlock.check_beam_on, _done)
 
     def _set_beam_status(self, status: BeamStatus):
         """Update beam status indicator label."""
@@ -4644,21 +5508,31 @@ class DeviceControlApp(tk.Tk):
             self.beam_status_label.config(text="BEAM: --", bg=PALETTE['border'], fg=PALETTE['text'])
 
     def _on_beam_enable(self):
-        """Enable beam via L:BSTUDY."""
+        """Enable beam via L:BSTUDY (ACNET call off the Tk thread, #5)."""
         role = self._get_beam_role()
-        ok = self.beam_interlock.enable_beam(role)
-        self._refresh_beam_status()
-        if ok:
-            print("[SUCCESS] Beam enable command sent")
-        else:
-            print("[ERROR] Beam enable failed — check log")
+
+        def _done(ok, error):
+            if error is not None:
+                print(f"[ERROR] Beam enable failed: {error}")
+                self._set_beam_status(BeamStatus.UNKNOWN)
+                return
+            self._refresh_beam_status()
+            if ok:
+                print("[SUCCESS] Beam enable command sent")
+            else:
+                print("[ERROR] Beam enable failed — check log")
+
+        self._run_beam_op_async(lambda: self.beam_interlock.enable_beam(role), _done)
 
     def _on_beam_disable(self):
         """Disable beam via L:BSTUDY, then verify it actually went off.
 
         A sent command is not a confirmed state — if the control value is wrong
-        or the setting is rejected, the disable can silently no-op. This reads
-        L:BSTUDY status back and raises a loud alarm if the beam is still on.
+        or the setting is rejected, the disable can silently no-op. The blocking
+        disable + L:BSTUDY status readback run on a short worker thread (#5, still
+        through the single shared ACNET executor); the verify result and the loud
+        alarm modals are marshalled back to the Tk main thread. The confirm
+        prompt, scan-abort, and all modal/status-label behavior are preserved.
         """
         result = messagebox.askyesno(
             "Disable Beam",
@@ -4675,63 +5549,79 @@ class DeviceControlApp(tk.Tk):
             self.stop_scan_flag.set()
             print("[WARNING] Beam disable requested — scan abort requested")
 
-        try:
+        def _work():
+            # Returns (sent_ok, beam_on). Raises only if the disable command
+            # itself could not be sent (surfaced as `error` in _done).
             self.scanner.disable_beam(BEAM_CONTROL_DRF, role)
-        except Exception as e:
-            print(f"[ERROR] Beam disable command failed to send: {e}")
-            self._set_beam_status(BeamStatus.UNKNOWN)
-            messagebox.showerror(
-                "Beam Disable Failed",
-                f"The beam disable command could not be sent:\n\n{e}\n\n"
-                "MANUALLY VERIFY THE BEAM STATE."
-            )
-            return
+            # Verify: read L:BSTUDY status back rather than trusting the command.
+            beam_on = self.beam_interlock.check_beam_on()
+            return beam_on
 
-        # Verify: read L:BSTUDY status back rather than trusting the command.
-        beam_on = self.beam_interlock.check_beam_on()
-        if beam_on is False:
-            self._set_beam_status(BeamStatus.OFF)
-            print("[SUCCESS] Beam disable confirmed — beam is OFF")
-        elif beam_on is True:
-            self._set_beam_status(BeamStatus.ON)
-            print("[ERROR] CRITICAL: beam disable command sent but beam is STILL ON")
-            messagebox.showerror(
-                "Beam Still On",
-                "The beam disable command was sent, but L:BSTUDY reports the "
-                "beam is STILL ON.\n\nThe command may have been rejected or the "
-                "control value is wrong.\n\nDISABLE THE BEAM MANUALLY NOW."
-            )
-        else:
-            self._set_beam_status(BeamStatus.UNKNOWN)
-            print("[ERROR] Beam disable command sent but status could NOT be verified")
-            messagebox.showwarning(
-                "Beam State Unknown",
-                "The beam disable command was sent, but the beam status could "
-                "not be read back to confirm it.\n\nMANUALLY VERIFY THE BEAM STATE."
-            )
+        def _done(beam_on, error):
+            if error is not None:
+                print(f"[ERROR] Beam disable command failed to send: {error}")
+                self._set_beam_status(BeamStatus.UNKNOWN)
+                messagebox.showerror(
+                    "Beam Disable Failed",
+                    f"The beam disable command could not be sent:\n\n{error}\n\n"
+                    "MANUALLY VERIFY THE BEAM STATE."
+                )
+                return
 
-    def _build_loss_monitor_drf_list(self) -> list:
+            if beam_on is False:
+                self._set_beam_status(BeamStatus.OFF)
+                print("[SUCCESS] Beam disable confirmed — beam is OFF")
+            elif beam_on is True:
+                self._set_beam_status(BeamStatus.ON)
+                print("[ERROR] CRITICAL: beam disable command sent but beam is STILL ON")
+                messagebox.showerror(
+                    "Beam Still On",
+                    "The beam disable command was sent, but L:BSTUDY reports the "
+                    "beam is STILL ON.\n\nThe command may have been rejected or the "
+                    "control value is wrong.\n\nDISABLE THE BEAM MANUALLY NOW."
+                )
+            else:
+                self._set_beam_status(BeamStatus.UNKNOWN)
+                print("[ERROR] Beam disable command sent but status could NOT be verified")
+                messagebox.showwarning(
+                    "Beam State Unknown",
+                    "The beam disable command was sent, but the beam status could "
+                    "not be read back to confirm it.\n\nMANUALLY VERIFY THE BEAM STATE."
+                )
+
+        self._run_beam_op_async(_work, _done)
+
+    def _build_loss_monitor_drf_list(self, config=None) -> list:
         """DRF list for beam-loss monitors, read in the same event batch as scan data.
 
         Returns an empty list when the interlock is disabled so callers can
         unconditionally append it to the readback DRF list.
-        """
-        if not self.beam_interlock_config.enabled:
-            return []
-        event = self.beam_interlock_config.beam_event
-        return [f"{dev}{event}" for dev in self.beam_interlock.loss_monitor_devices]
 
-    def _check_loss_monitor_data(self, loss_data) -> Optional[BeamTripEvent]:
+        Args:
+            config: optional frozen BeamInterlockConfig snapshot. The scan worker
+                    passes its immutable snapshot so it reads only frozen state;
+                    None falls back to the live self.beam_interlock_config.
+        """
+        cfg = config if config is not None else self.beam_interlock_config
+        if not cfg.enabled:
+            return []
+        event = cfg.beam_event
+        return [f"{dev}{event}" for dev in self._loss_monitor_devices_from_config(cfg)]
+
+    def _check_loss_monitor_data(self, loss_data, config=None) -> Optional[BeamTripEvent]:
         """Check loss-monitor readings (already read alongside scan data).
 
         Args:
             loss_data: the loss-monitor slice of a read_once_on_event result —
                        a list of reading dicts (or None entries on timeout).
+            config: optional frozen BeamInterlockConfig snapshot (see
+                    _build_loss_monitor_drf_list). None uses the live config.
 
         Returns:
             BeamTripEvent if a threshold was exceeded, None otherwise.
         """
-        if not self.beam_interlock_config.enabled:
+        cfg = config if config is not None else self.beam_interlock_config
+        if not cfg.enabled:
             return None
 
         readings = {}
@@ -4743,7 +5633,46 @@ class DeviceControlApp(tk.Tk):
                     # Non-scalar reading — can't evaluate this monitor; skip it.
                     pass
 
-        return self.beam_interlock.check_losses(readings)
+        # Evaluate against the frozen thresholds directly so the worker never
+        # reads live self.beam_interlock_config via the monitor object.
+        for device, threshold in cfg.loss_monitors.items():
+            value = readings.get(device)
+            if value is not None and value > threshold:
+                event = BeamTripEvent(
+                    device=device,
+                    value=float(value),
+                    threshold=threshold,
+                    timestamp=datetime.now(),
+                )
+                print(f"[ERROR] LOSS MONITOR EXCEEDED: {device} = {value:.4f} "
+                      f"> threshold {threshold:.4f}")
+                return event
+        return None
+
+    def _missing_loss_monitors(self, loss_data, config) -> list:
+        """Configured+enabled loss monitors with NO usable reading this step.
+
+        A loss monitor is "missing" if its slot is absent/None, or its reading
+        is non-finite (NaN/inf). Returned so the scan loop can track loss-monitor
+        misses INDEPENDENTLY of the BPM slice and never silently treat an absent
+        safety monitor as OK. Returns [] when the interlock is disabled.
+        """
+        if config is None or not config.enabled:
+            return []
+        expected = self._loss_monitor_devices_from_config(config)
+        if not expected:
+            return []
+        readings = {}
+        for item in loss_data:
+            if isinstance(item, dict) and 'name' in item and 'data' in item:
+                name = item['name']
+                try:
+                    val = float(item['data'])
+                except (TypeError, ValueError):
+                    continue
+                if math.isfinite(val):
+                    readings[name] = val
+        return [dev for dev in expected if dev not in readings]
 
     def _on_closing(self):
             """Handle window closing event with proper cleanup."""

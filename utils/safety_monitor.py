@@ -4,6 +4,7 @@ Safety Monitoring System
 Real-time monitoring of device readings to prevent beam trips and radiation events.
 """
 
+import math
 import numpy as np
 import threading
 from datetime import datetime
@@ -54,6 +55,10 @@ class SafetyMonitor:
         self._abort_triggered = False
         self._last_check_time = None
 
+        # Non-finite (NaN/inf) readings seen on the most recent check_batch call.
+        # These are reported (for Device Health) but never trigger an abort.
+        self._last_nonfinite_devices: List[str] = []
+
     def update_config(self, config: SafetyConfiguration):
         """Update the safety configuration."""
         with self._lock:
@@ -79,11 +84,33 @@ class SafetyMonitor:
         with self._lock:
             self._add_reading_unlocked(device, value)
 
-    def _add_reading_unlocked(self, device: str, value: float):
-        """Add a reading without acquiring the lock (caller must hold self._lock)."""
+    @staticmethod
+    def _is_finite(value) -> bool:
+        """
+        Return True if value is a real, finite number (not NaN/inf/None).
+        Non-finite readings must never be buffered or fed into a mean.
+        """
+        try:
+            return math.isfinite(value)
+        except (TypeError, ValueError):
+            return False
+
+    def _add_reading_unlocked(self, device: str, value: float) -> bool:
+        """
+        Add a reading without acquiring the lock (caller must hold self._lock).
+
+        Non-finite values (NaN/inf) are NOT buffered so they cannot poison the
+        running mean.
+
+        Returns:
+            True if the value was buffered, False if it was dropped as non-finite.
+        """
+        if not self._is_finite(value):
+            return False
         if device not in self._data_buffers:
             self._data_buffers[device] = deque(maxlen=self.config.buffer_size)
         self._data_buffers[device].append(value)
+        return True
 
     def _check_reading_unlocked(self, device: str, value: float,
                                 timestamp: datetime) -> Optional[SafetyViolation]:
@@ -99,8 +126,10 @@ class SafetyMonitor:
         Returns:
             SafetyViolation if threshold exceeded, None otherwise
         """
-        # Add to buffer
-        self._add_reading_unlocked(device, value)
+        # Add to buffer. A non-finite reading is dropped (not buffered) and
+        # must never produce a violation/abort on its own.
+        if not self._add_reading_unlocked(device, value):
+            return None
 
         # Check if we have a baseline for this device
         baseline = self.config.get_baseline(device)
@@ -186,22 +215,34 @@ class SafetyMonitor:
 
         return violation
 
-    def check_batch(self, data_batch: List[Dict]) -> List[SafetyViolation]:
+    def check_batch(self, data_batch: List[Dict],
+                    nonfinite_out: Optional[List[str]] = None) -> List[SafetyViolation]:
         """
         Check a batch of readings (from ACNET scan step).
         Per-device mode: single lock for entire batch, record outside lock.
         Overall mode: delegates to _check_overall_mean (handles own lock).
 
+        Non-finite readings (NaN/inf) are NOT buffered and never poison the
+        mean. The offending device names are collected and reported (for a
+        Device Health report) but do NOT trigger an abort and never raise.
+        They are exposed two ways:
+          * appended to the optional ``nonfinite_out`` list, if provided;
+          * available afterward via :meth:`get_last_nonfinite_devices`.
+
         Args:
             data_batch: List of dicts with keys: 'name', 'data', 'stamp'
+            nonfinite_out: Optional list the caller passes in; offending device
+                names for this batch are appended to it.
 
         Returns:
-            List of SafetyViolation objects (empty if all safe)
+            List of SafetyViolation objects (empty if all safe). Non-finite
+            readings are NOT represented here.
         """
         if not self.config.enabled:
             return []
 
         violations = []
+        nonfinite_devices: List[str] = []
 
         # Per-device monitoring — single lock for entire batch
         if self.config.threshold_type == SafetyThresholdType.PER_DEVICE_MEAN:
@@ -214,11 +255,17 @@ class SafetyMonitor:
                         timestamp = datetime.now()
 
                     if device and value is not None:
+                        # Flag (but do not buffer) non-finite readings.
+                        if not self._is_finite(value):
+                            nonfinite_devices.append(device)
+                            continue
+
                         violation = self._check_reading_unlocked(device, value, timestamp)
                         if violation:
                             violations.append(violation)
 
                 self._last_check_time = datetime.now()
+                self._last_nonfinite_devices = list(nonfinite_devices)
 
             # Record all violations/warnings outside lock
             for violation in violations:
@@ -229,22 +276,39 @@ class SafetyMonitor:
 
         # Overall mean monitoring (across all devices)
         elif self.config.threshold_type == SafetyThresholdType.OVERALL_MEAN:
-            overall_violation = self._check_overall_mean(data_batch)
+            overall_violation = self._check_overall_mean(data_batch, nonfinite_devices)
             if overall_violation:
                 violations.append(overall_violation)
 
             with self._lock:
                 self._last_check_time = datetime.now()
+                self._last_nonfinite_devices = list(nonfinite_devices)
+
+        # Surface offending device names to the caller (Device Health report).
+        if nonfinite_out is not None:
+            nonfinite_out.extend(nonfinite_devices)
 
         return violations
 
-    def _check_overall_mean(self, data_batch: List[Dict]) -> Optional[SafetyViolation]:
+    def get_last_nonfinite_devices(self) -> List[str]:
+        """
+        Return the device names whose reading was non-finite (NaN/inf) on the
+        most recent check_batch call. Reported for Device Health; never an abort.
+        """
+        with self._lock:
+            return list(self._last_nonfinite_devices)
+
+    def _check_overall_mean(self, data_batch: List[Dict],
+                            nonfinite_devices: Optional[List[str]] = None
+                            ) -> Optional[SafetyViolation]:
         """
         Check overall mean shift across all devices.
         All computation inside lock; violation/warning recorded outside lock.
 
         Args:
             data_batch: List of readings
+            nonfinite_devices: Optional list to collect device names whose
+                reading was non-finite (NaN/inf). Such readings are not buffered.
 
         Returns:
             SafetyViolation if overall threshold exceeded
@@ -252,12 +316,15 @@ class SafetyMonitor:
         violation = None
 
         with self._lock:
-            # Add all readings to buffers
+            # Add all readings to buffers. Non-finite readings are dropped by
+            # _add_reading_unlocked; flag them so the caller can report them.
             for item in data_batch:
                 device = item.get('name')
                 value = item.get('data')
                 if device and value is not None:
-                    self._add_reading_unlocked(device, value)
+                    if not self._add_reading_unlocked(device, value):
+                        if nonfinite_devices is not None:
+                            nonfinite_devices.append(device)
 
             # Devices ready to contribute: baselined AND enough samples buffered.
             # The minimum-samples gate must be PER-DEVICE (same as the per-device
@@ -455,11 +522,16 @@ class SafetyMonitor:
             DeviceBaseline object
 
         Raises:
-            ValueError: If values is empty
+            ValueError: If values is empty (or contains no finite samples)
         """
         if not values:
             raise ValueError(f"Cannot calculate baseline for {device}: no data")
-        arr = np.array(values)
+        # Exclude non-finite (NaN/inf) samples so they cannot poison the baseline.
+        finite_values = [v for v in values if SafetyMonitor._is_finite(v)]
+        if not finite_values:
+            raise ValueError(
+                f"Cannot calculate baseline for {device}: no finite data")
+        arr = np.array(finite_values)
         return DeviceBaseline(
             device=device,
             mean=float(np.mean(arr)),
@@ -467,6 +539,6 @@ class SafetyMonitor:
             std=float(np.std(arr)),
             min_val=float(np.min(arr)),
             max_val=float(np.max(arr)),
-            sample_count=len(values),
+            sample_count=len(finite_values),
             timestamp=datetime.now()
         )

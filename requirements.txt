@@ -9,6 +9,10 @@ openpyxl>=3.0.0
 pyyaml>=5.3
 h5py>=2.10.0
 
-# Note: acsys module needs to be installed separately from Fermilab sources
+# acsys must be installed separately from Fermilab sources.
+# Pinned to the production version recorded in the monitor logs; the v1 DPM
+# reply API (reply.isReading / reply.isStatus) is asserted at import time by
+# utils/acsys_compat.assert_compatible_api().
+acsys==0.12.8
 # Note: tkinter usually comes with Python installation
 PyQt5>=5.15.0

@@ -82,7 +82,13 @@ class BeamInterlockMonitor:
         return None
 
     def trip_beam(self, trip_event: BeamTripEvent, role: str) -> bool:
-        """Disable beam due to loss monitor violation."""
+        """Disable beam due to loss monitor violation.
+
+        Returns True ONLY if the beam is confirmed OFF: disable_beam reports a
+        positively-confirmed disable AND a check_beam_on() readback shows the
+        beam is OFF. On any unconfirmed/failed outcome returns False so the scan
+        loop can escalate (e.g. to a modal).
+        """
         self._tripped = True
         self._trip_event = trip_event
         self._trip_history.append(trip_event)
@@ -90,12 +96,27 @@ class BeamInterlockMonitor:
         print(f"[ERROR] BEAM TRIP INITIATED: {trip_event}")
 
         try:
-            self.scanner.disable_beam(BEAM_CONTROL_DRF, role)
-            print("[INFO] Beam disable command sent successfully")
-            return True
+            disabled = self.scanner.disable_beam(BEAM_CONTROL_DRF, role)
         except Exception as e:
             print(f"[ERROR] CRITICAL: Failed to disable beam: {e}")
             return False
+
+        # Independent readback confirmation: beam must be positively OFF.
+        try:
+            beam_on = self.check_beam_on()
+        except Exception as e:
+            print(f"[ERROR] CRITICAL: Failed to read back beam status after "
+                  f"disable: {e}")
+            beam_on = None
+
+        if disabled and beam_on is False:
+            print("[INFO] Beam trip confirmed: beam is OFF")
+            return True
+
+        print(f"[ERROR] CRITICAL: Beam trip NOT confirmed OFF "
+              f"(disable_confirmed={disabled}, beam_on={beam_on}) — escalation "
+              f"required")
+        return False
 
     def check_beam_on(self) -> Optional[bool]:
         """Check if beam is currently on.
@@ -108,18 +129,24 @@ class BeamInterlockMonitor:
 
     def enable_beam(self, role: str) -> bool:
         try:
-            self.scanner.enable_beam(BEAM_CONTROL_DRF, role)
-            print("[INFO] Beam enable command sent")
-            return True
+            ok = bool(self.scanner.enable_beam(BEAM_CONTROL_DRF, role))
+            if ok:
+                print("[INFO] Beam enable command confirmed")
+            else:
+                print("[WARNING] Beam enable command NOT confirmed")
+            return ok
         except Exception as e:
             print(f"[ERROR] Failed to enable beam: {e}")
             return False
 
     def disable_beam(self, role: str) -> bool:
         try:
-            self.scanner.disable_beam(BEAM_CONTROL_DRF, role)
-            print("[INFO] Beam disable command sent")
-            return True
+            ok = bool(self.scanner.disable_beam(BEAM_CONTROL_DRF, role))
+            if ok:
+                print("[INFO] Beam disable confirmed OFF")
+            else:
+                print("[WARNING] Beam disable NOT confirmed")
+            return ok
         except Exception as e:
             print(f"[ERROR] Failed to disable beam: {e}")
             return False

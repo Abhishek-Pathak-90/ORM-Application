@@ -23,6 +23,9 @@ DEFAULT_FONT_SIZE = 10
 HEADING_FONT_SIZE = 11
 
 # ACNET Configuration
+# Pinned production acsys version. utils/acsys_compat.assert_compatible_api()
+# checks the installed acsys against this and the v1 DPM reply API at import time.
+EXPECTED_ACSYS_VERSION = "0.12.8"
 ACNET_ROLES = ["OPERATOR", "testing", "linac_trims", "linac_quads"]
 DEFAULT_ACNET_ROLE = "OPERATOR"
 DEFAULT_ACNET_EVENT = "@p,1000"
@@ -87,6 +90,12 @@ BEAM_CONTROL_DRF = "L:BSTUDY.CONTROL@N"
 BEAM_OFF_VALUE = "off"   # Value sent to L:BSTUDY.CONTROL to disable beam
 BEAM_ON_VALUE = "on"     # Value sent to L:BSTUDY.CONTROL to enable beam
 BEAM_INTERLOCK_ENABLED_BY_DEFAULT = False
+
+# Max consecutive missed/empty loss-monitor reads tolerated before the scan
+# loop treats the loss monitor as unreadable (reuses the consecutive-tolerance
+# pattern of ACNET_MAX_CONSECUTIVE_TIMEOUTS).
+# TODO confirm value with controls/ops
+LOSS_MONITOR_MAX_CONSECUTIVE_MISSES = 5
 
 # Default loss monitor thresholds (device -> max allowed value)
 DEFAULT_LOSS_MONITORS = {

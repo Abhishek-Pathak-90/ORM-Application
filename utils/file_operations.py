@@ -5,12 +5,134 @@ Provides threaded file I/O operations to prevent GUI freezing.
 Uses non-daemon threads to prevent file corruption on app exit.
 """
 
+import os
+import tempfile
 import threading
 import pandas as pd
 import json
 from pathlib import Path
 from typing import Callable, Optional, Any, Dict
 from datetime import datetime
+
+
+def atomic_write_text(path, text, encoding='utf-8'):
+    """
+    Atomically write ``text`` to ``path``.
+
+    Writes to a temporary file in the SAME directory as the target, flushes and
+    fsyncs to disk, then os.replace() onto the final path so a reader never sees
+    a partially written file. The temp file is removed on error.
+
+    Args:
+        path: Destination file path (str or Path).
+        text: String contents to write.
+        encoding: Text encoding (default 'utf-8').
+
+    Returns:
+        The final path as a string.
+    """
+    path = os.fspath(path)
+    directory = os.path.dirname(os.path.abspath(path))
+    tmp_path = None
+    try:
+        fd, tmp_path = tempfile.mkstemp(dir=directory, suffix='.tmp')
+        try:
+            with os.fdopen(fd, 'w', encoding=encoding) as f:
+                f.write(text)
+                f.flush()
+                os.fsync(f.fileno())
+        except BaseException:
+            # fdopen took ownership of fd; if it failed before that, close fd.
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            raise
+        os.replace(tmp_path, path)
+        tmp_path = None
+        return path
+    finally:
+        if tmp_path is not None and os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+
+
+def atomic_write_bytes(path, data):
+    """
+    Atomically write ``data`` (bytes) to ``path``.
+
+    Writes to a temporary file in the SAME directory as the target, flushes and
+    fsyncs to disk, then os.replace() onto the final path. The temp file is
+    removed on error.
+
+    Args:
+        path: Destination file path (str or Path).
+        data: Bytes-like object to write.
+
+    Returns:
+        The final path as a string.
+    """
+    path = os.fspath(path)
+    directory = os.path.dirname(os.path.abspath(path))
+    tmp_path = None
+    try:
+        fd, tmp_path = tempfile.mkstemp(dir=directory, suffix='.tmp')
+        try:
+            with os.fdopen(fd, 'wb') as f:
+                f.write(data)
+                f.flush()
+                os.fsync(f.fileno())
+        except BaseException:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            raise
+        os.replace(tmp_path, path)
+        tmp_path = None
+        return path
+    finally:
+        if tmp_path is not None and os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+
+
+def atomic_to_csv(df, path, **to_csv_kwargs):
+    """
+    Atomically write a DataFrame to ``path`` as CSV.
+
+    Writes ``df`` to a temporary file in the SAME directory as the target, then
+    os.replace() onto the final path so the destination is never partially
+    written. Drop-in replacement for ``df.to_csv(path, **kwargs)``.
+
+    Args:
+        df: pandas DataFrame to write.
+        path: Destination CSV path (str or Path).
+        **to_csv_kwargs: Passed through to ``DataFrame.to_csv``.
+
+    Returns:
+        The final path as a string.
+    """
+    path = os.fspath(path)
+    directory = os.path.dirname(os.path.abspath(path))
+    tmp_path = None
+    try:
+        fd, tmp_path = tempfile.mkstemp(dir=directory, suffix='.tmp')
+        os.close(fd)
+        df.to_csv(tmp_path, **to_csv_kwargs)
+        os.replace(tmp_path, path)
+        tmp_path = None
+        return path
+    finally:
+        if tmp_path is not None and os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
 
 
 class BackgroundFileOps:
