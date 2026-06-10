@@ -159,6 +159,24 @@ class AcnetScanner:
                 executor = self._acnet_executor
             return executor, executor.submit(acsys.run_client, async_fn, **kwargs)
 
+    def _retire_executor(self, executor):
+        """Retire `executor` (its single worker thread — and that thread's reused
+        event loop plus any deferred ACNET-connection teardown — go with it) and
+        install a fresh one, so subsequent ACNET calls run on a CLEAN thread / event
+        loop / connection. No-op if `executor` is no longer the active one. This is
+        the logic the stuck-abort path used inline, extracted so the NORMAL
+        persistent-scan completion path can reuse it: the held-open engine session's
+        deferred teardown would otherwise strand on the reused loop and break the
+        immediately-following post-scan nominal restore."""
+        with self._executor_lock:
+            if self._acnet_executor is executor:
+                self._acnet_executor = self._new_acnet_executor()
+                retired = executor
+            else:
+                retired = None
+        if retired is not None:
+            retired.shutdown(wait=False)
+
     def _call_with_timeout(self, async_fn, timeout, default_return=None,
                            abort_check=None, **kwargs):
         """Run acsys.run_client with a hard outer timeout to prevent indefinite blocking.
@@ -502,7 +520,7 @@ class AcnetScanner:
 
     async def _advance_on_event_scan_async(self, con, combined_drf_list, set_drf_list,
                                            initial_values, role, on_event, abort_check,
-                                           per_event_tmo):
+                                           per_event_tmo, confirm=None, max_wait=15):
         """Persistent two-context scan body. ONE settings context with
         `enable_settings()` called ONCE up front (the PER-STEP enable was the old
         streaming-v6 stall), plus ONE read subscription kept open for the whole
@@ -536,6 +554,12 @@ class AcnetScanner:
                 seen = 0
                 event_start = None
                 done = False
+                # Option B (confirm-before-advance) state. last/prev_applied track
+                # the setpoint vectors so `confirm` can tell whether the readback
+                # has caught up; wait bounds how long we skip before giving up.
+                wait = 0
+                last_applied = list(initial_values)
+                prev_applied = list(initial_values)
                 while not done:
                     if abort_check and abort_check():
                         break
@@ -566,11 +590,25 @@ class AcnetScanner:
                         # incomplete for per_event_tmo (a device dropped this event).
                         if seen >= n or (event_start is not None
                                          and now - event_start >= per_event_tmo):
+                            # Option B: on a COMPLETE event, if the readback does not
+                            # yet reflect the last setpoint, SKIP it (no record/advance)
+                            # and wait — up to max_wait events — for the device to catch
+                            # up. confirm=None => Option A (advance on every event).
+                            if (confirm is not None and seen >= n and wait < max_wait
+                                    and not confirm(list(snap), last_applied, prev_applied)):
+                                wait += 1
+                                snap = [None] * n
+                                seen = 0
+                                event_start = None
+                                continue
+                            wait = 0
                             nxt = on_event(idx, list(snap), seen >= n)
                             idx += 1
                             if nxt is None:
                                 done = True
                                 break
+                            prev_applied = last_applied
+                            last_applied = list(nxt)
                             await sdpm.apply_settings(list(enumerate(nxt)))
                             snap = [None] * n
                             seen = 0
@@ -592,7 +630,8 @@ class AcnetScanner:
                         event_start = None
 
     def run_advance_on_event_scan(self, combined_drf_list, set_devices, initial_values,
-                                  role, on_event, abort_check=None, per_event_tmo=2.0):
+                                  role, on_event, abort_check=None, per_event_tmo=2.0,
+                                  confirm=None, max_wait=15):
         """Run a persistent advance-on-event scan (see _advance_on_event_scan_async).
 
         Submits to the SAME single persistent executor as every other ACNET call
@@ -614,11 +653,12 @@ class AcnetScanner:
             self._advance_on_event_scan_async,
             dict(combined_drf_list=combined_drf_list, set_drf_list=set_drf_list,
                  initial_values=list(initial_values), role=role, on_event=on_event,
-                 abort_check=abort_check, per_event_tmo=per_event_tmo))
+                 abort_check=abort_check, per_event_tmo=per_event_tmo,
+                 confirm=confirm, max_wait=max_wait))
         abort_deadline = None
         while True:
             try:
-                return future.result(timeout=0.5)
+                result = future.result(timeout=0.5)
             except concurrent.futures.TimeoutError:
                 # Still running — legitimate for a multi-minute scan. But if Stop was
                 # requested and the worker has not exited within a grace window, a
@@ -630,32 +670,81 @@ class AcnetScanner:
                     elif time.monotonic() >= abort_deadline:
                         print("[WARNING] Persistent scan did not stop within 30 s of "
                               "abort — retiring stuck ACNET worker.")
-                        with self._executor_lock:
-                            if self._acnet_executor is executor:
-                                self._acnet_executor = self._new_acnet_executor()
-                                retired = executor
-                            else:
-                                retired = None
-                        if retired is not None:
-                            retired.shutdown(wait=False)
+                        self._retire_executor(executor)
                         return None
                 continue
             except Exception as e:
+                # The engine errored. Whatever state its held-open session left, the
+                # caller's `finally` is about to run the post-scan nominal restore on
+                # THIS same worker — hand it a clean one first, then propagate.
+                self._retire_executor(executor)
                 err_lower = str(e).lower()
                 if (('credential' in err_lower and 'expired' in err_lower) or
                         ('ticket' in err_lower and 'expired' in err_lower) or
                         ('gss' in err_lower and 'expired' in err_lower)):
                     raise CredentialExpiredError(str(e)) from e
                 raise
+            else:
+                # The engine held ONE settings context + ONE read subscription open
+                # for the entire scan. acsys tears a context down with only a task
+                # cancel (DPMContext.__aexit__ -> _shutdown) and the connection with
+                # only `del con` (run_client's __client_main) — no StopList, no
+                # explicit close — so that teardown is DEFERRED onto this reused event
+                # loop. The very next ACNET call on this worker (the post-scan nominal
+                # restore) would then run on a not-yet-drained loop and silently fail
+                # to land its SET — the devices stay at scan values and only the
+                # verify banner catches it. Retire this worker so every post-engine op
+                # (nominal restore, trip-restore, beam-trip, verify readback) runs on a
+                # FRESH thread / event loop / connection. Cost: one cold ACNET
+                # connection per scan — negligible, and the price of a reliable reset.
+                self._retire_executor(executor)
+                return result
 
     # =========================================================================
     # DPM Discovery
     # =========================================================================
 
     async def _find_all_dpms_async(self, con):
-        """Discover all active DPM nodes."""
+        """Discover all active DPM nodes (bounded — does NOT use available_dpms).
+
+        acsys.dpm.available_dpms() HANGS on this control system: its multicast
+        request_stream to DPMD@MCAST collects every DPM's reply but then waits
+        forever for a terminating ACNET_UTIME that never arrives, so its
+        `async for` loop never ends. (find_dpm — a single request_reply — works
+        in ~25 ms, which is why scans auto-discover fine but "Discover" did not.)
+        We run the same multicast but cap the wait for each successive reply, so
+        we return whatever responded and never block. Verified on the machine:
+        returns all ~13 DPMs in ~0.45 s.
+        """
         self._install_loop_cleanup_handler()
-        return await acsys.dpm.available_dpms(con)
+        import acsys.status
+        from acsys.dpm import dpm_protocol
+        result = []
+        msg = dpm_protocol.ServiceDiscovery_request()
+        gen = con.request_stream('DPMD@MCAST', msg,
+                                 proto=acsys.dpm.dpm_protocol, timeout=150)
+        it = gen.__aiter__()
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + 2.0           # hard total cap
+        try:
+            while loop.time() < deadline:
+                try:
+                    replier, _ = await asyncio.wait_for(it.__anext__(), 0.4)
+                except asyncio.TimeoutError:
+                    break                      # responders went quiet -> done
+                except StopAsyncIteration:
+                    break
+                except acsys.status.Status as e:
+                    if e != acsys.status.ACNET_UTIME:
+                        raise
+                    break
+                result.append(await con.get_name(replier))
+        finally:
+            try:
+                await asyncio.wait_for(gen.aclose(), 1.0)
+            except Exception:
+                pass
+        return result
 
     def discover_dpms(self) -> List[str]:
         """Return a list of available DPM node names."""
@@ -665,6 +754,40 @@ class AcnetScanner:
             default_return=[],
         )
         return result if result else []
+
+    async def _verify_dpm_node_async(self, con):
+        """Open and close one DPM context against the PINNED node. Proves the
+        node answers a DIRECTED discovery (acsys gives it only 150 ms per
+        context open) AND accepts an OpenList. Raises on any failure."""
+        self._install_loop_cleanup_handler()
+        async with acsys.dpm.DPMContext(con, dpm_node=self.dpm_node):
+            pass
+        return True
+
+    def verify_dpm_node(self) -> bool:
+        """Preflight a pinned DPM node; True when usable (or when on Auto).
+
+        WHY: with dpm_node=None acsys multicasts and the FIRST of all DPMs to
+        answer within 150 ms wins (effectively always works). With a pinned
+        node, EVERY context open sends a directed request to that one node
+        with the same hard 150 ms timeout; a slow/busy/retired node makes
+        find_dpm return None and acsys then crashes with a cryptic
+        "'NoneType' object has no attribute ..." before the scan starts.
+        This check fails FAST with a clear answer instead, so the caller can
+        fall back to auto-discovery loudly.
+        """
+        if not self.dpm_node:
+            return True
+        try:
+            result = self._call_with_timeout(
+                self._verify_dpm_node_async,
+                timeout=10.0,
+                default_return=False,
+            )
+            return bool(result)
+        except Exception as e:
+            print(f"[WARNING] Pinned DPM '{self.dpm_node}' preflight failed: {e}")
+            return False
 
     # =========================================================================
     # Beam Control (L:BSTUDY)

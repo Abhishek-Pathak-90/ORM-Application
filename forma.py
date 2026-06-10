@@ -176,6 +176,7 @@ class DeviceControlApp(tk.Tk):
         self.stop_scan_flag = threading.Event()
         self.fft_data = None
         self._aligned_fft_data = None
+        self._fft_hover_cid = None  # matplotlib cid for the FFT hover handler (connect-once)
         self.fft_scan_params = None
         self.scan_progressbar = None
         self.rms_progressbar = None
@@ -201,7 +202,7 @@ class DeviceControlApp(tk.Tk):
         self.preview_scan_button = None
         
         # Default setting/reading values
-        self.setting_role = tk.StringVar(value="OPERATOR")
+        self.setting_role = tk.StringVar(value="testing")
         self.acnet_event = tk.StringVar(value="@p,1000")
         self.dpm_node = tk.StringVar(value="")  # empty = auto-discover
         self.plotted_device = tk.StringVar()
@@ -211,6 +212,11 @@ class DeviceControlApp(tk.Tk):
         # engine (machine-validated 2026-06-04, ~6x faster). Default OFF keeps the
         # existing serial _synchronous_scan_loop as the path.
         self.use_persistent_scan = tk.BooleanVar(value=False)
+        # Within the persistent path: confirm the corrector readback reflects each
+        # setpoint before recording/advancing (Option B). Aligns .SETTING with the
+        # readback, at the cost of acquisition rate (it skips events while the device
+        # catches up). OFF = advance on every event (Option A, fast — the default).
+        self.persistent_confirm_mode = tk.BooleanVar(value=False)
         self.auto_calc_orm = tk.BooleanVar(value=False)
         
         # Scan parameters
@@ -440,6 +446,29 @@ class DeviceControlApp(tk.Tk):
         node = self.dpm_node.get().strip() or None
         self.scanner.dpm_node = node
 
+    def _ensure_dpm_node_usable(self):
+        """Worker-thread preflight for a PINNED DPM node; falls back to auto.
+
+        With a pinned node acsys gets only 150 ms for a DIRECTED lookup at
+        EVERY context open; a slow/busy/retired node makes find_dpm return
+        None and the scan dies before starting with a cryptic NoneType error
+        (observed 2026-06-10). Verify once up front; on failure print loudly
+        and fall back to auto-discovery so the scan still runs."""
+        node = self.scanner.dpm_node
+        if not node:
+            return
+        print(f"[INFO] Verifying pinned DPM node '{node}' ...")
+        if self.scanner.verify_dpm_node():
+            print(f"[SUCCESS] DPM '{node}' answered and accepted a list.")
+            return
+        print(f"[WARNING] Pinned DPM '{node}' did not respond to a directed "
+              f"request or refused a list — falling back to AUTO discovery "
+              f"so the scan can run. (Auto multicasts and uses the first "
+              f"responder; the pinned path needs THAT node to answer in 150 ms.)")
+        self.scanner.dpm_node = None
+        if not self._closing:
+            self.after(0, self.dpm_node.set, "")
+
     def _discover_dpms(self):
         """Discover available DPM nodes and populate the combo box."""
         self._sync_dpm_node()
@@ -592,6 +621,9 @@ class DeviceControlApp(tk.Tk):
         # serial path until the persistent path is machine-validated end to end).
         ttk.Checkbutton(scan_mode_frame, text="Persistent (advance-on-event, ~6x — Simultaneous only)",
                         variable=self.use_persistent_scan).pack(side='left', padx=20)
+        # Option B within the persistent path: confirm readback before advancing.
+        ttk.Checkbutton(scan_mode_frame, text="Confirm setpoint before advancing (.SETTING aligned, slower)",
+                        variable=self.persistent_confirm_mode).pack(side='left', padx=5)
 
         # Frame for save location
         save_loc_frame = ttk.LabelFrame(main_frame, text="Scan Data Save Location", padding=8, style="Section.TLabelframe")
@@ -2107,18 +2139,26 @@ class DeviceControlApp(tk.Tk):
         # Pre-capture tkinter var on main thread before starting scan thread
         acnet_event = self.acnet_event.get()
         use_persistent = self.use_persistent_scan.get()
+        confirm_mode = self.persistent_confirm_mode.get()
         if scan_mode == "Simultaneous":
             # Opt-in persistent advance-on-event engine; default off -> serial path.
             if use_persistent:
                 print("[INFO] Using the persistent advance-on-event engine "
-                      "(machine-validated ~6x faster, no per-step teardown).")
-            sync_target = (self._persistent_synchronous_scan_loop if use_persistent
-                           else self._synchronous_scan_loop)
-            thread = threading.Thread(
-                target=sync_target,
-                args=(run_config, metadata, acnet_event, frozen_interlock_config),
-                daemon=True,
-            )
+                      "(machine-validated ~6x faster, no per-step teardown)"
+                      + (" — confirm-before-advance ON (.SETTING aligned, slower)."
+                         if confirm_mode else "."))
+                thread = threading.Thread(
+                    target=self._persistent_synchronous_scan_loop,
+                    args=(run_config, metadata, acnet_event, frozen_interlock_config,
+                          confirm_mode),
+                    daemon=True,
+                )
+            else:
+                thread = threading.Thread(
+                    target=self._synchronous_scan_loop,
+                    args=(run_config, metadata, acnet_event, frozen_interlock_config),
+                    daemon=True,
+                )
         else:  # Sequential
             # Capture tkinter vars on main thread before starting scan thread
             seq_save_dir = self.scan_data_path.get()
@@ -2160,6 +2200,7 @@ class DeviceControlApp(tk.Tk):
             interlock_config = copy.deepcopy(self.beam_interlock_config)
         interlock_enabled = interlock_config.enabled
         try:
+            self._ensure_dpm_node_usable()
             # Clear stale nominals from prior scans before storing new ones
             self.nominal_settings.clear()
 
@@ -2419,8 +2460,14 @@ class DeviceControlApp(tk.Tk):
                     self.after(0, self._update_scan_buttons, False)
 
     def _persistent_synchronous_scan_loop(self, run_config, metadata, acnet_event=None,
-                                          interlock_config=None):
+                                          interlock_config=None, confirm_mode=False):
         """OPT-IN persistent advance-on-event variant of _synchronous_scan_loop.
+
+        confirm_mode=True selects Option B (confirm-before-advance): the engine skips
+        events until the corrector readback reflects the just-applied setpoint, so the
+        recorded .SETTING aligns with the readback — at the cost of acquisition rate.
+        confirm_mode=False (default) is Option A: advance on every event (fast). The
+        ORM is unaffected either way (it uses the co-sampled readback, not .SETTING).
 
         Same preflight, safety contract, and teardown as the serial loop, but the
         per-step apply+read (two fresh DPMContexts per step, ~1.2 s) is replaced by
@@ -2459,6 +2506,7 @@ class DeviceControlApp(tk.Tk):
               'safety_abort': False, 'scan_error': False, 'pending_trip': None,
               'user_stopped': False}
         try:
+            self._ensure_dpm_node_usable()
             self.nominal_settings.clear()
             try:
                 nominals = self._acnet_call_with_renewal(
@@ -2483,6 +2531,26 @@ class DeviceControlApp(tk.Tk):
             restore_devices = devices_to_scan
             restore_values = nominal_vector
             total_steps = run_config.total_steps
+
+            # Option B confirm predicate (used only when confirm_mode). Each
+            # corrector's readback (its slot in the read list) must be at least as
+            # close to the just-applied setpoint as to the previous one before we
+            # record/advance — scale-free, no tolerance. corr_read_idx stays aligned
+            # to devices_to_scan (-1 = corrector not in the read list -> not checked).
+            corr_read_idx = [scan_drf_devices.index(d) if d in scan_drf_devices else -1
+                             for d in devices_to_scan]
+
+            def _confirm(snapshot, last_applied, prev_applied):
+                for ci, cur, prev in zip(corr_read_idx, last_applied, prev_applied):
+                    if ci < 0:
+                        continue
+                    item = snapshot[ci]
+                    if not item or item.get('data') is None:
+                        return False
+                    rb = float(item['data'])
+                    if abs(rb - float(cur)) > abs(rb - float(prev)):
+                        return False
+                return True
 
             def _step_values(step):
                 return self._compute_scan_step_values(
@@ -2597,7 +2665,8 @@ class DeviceControlApp(tk.Tk):
             # 5 consecutive stalls still auto-abort (~25 s), like the serial loop.
             self.scanner.run_advance_on_event_scan(
                 combined_drf_list, devices_to_scan, _step_values(0), run_config.role,
-                on_event, abort_check=self.stop_scan_flag.is_set, per_event_tmo=5.0)
+                on_event, abort_check=self.stop_scan_flag.is_set, per_event_tmo=5.0,
+                confirm=(_confirm if confirm_mode else None))
 
             safety_abort_occurred = st['safety_abort']
             scan_error = st['scan_error']
@@ -2668,6 +2737,7 @@ class DeviceControlApp(tk.Tk):
             interlock_config = copy.deepcopy(self.beam_interlock_config)
         interlock_enabled = interlock_config.enabled
         try:
+            self._ensure_dpm_node_usable()
             # Clear stale nominals from prior scans before storing new ones
             self.nominal_settings.clear()
 
@@ -3465,7 +3535,13 @@ class DeviceControlApp(tk.Tk):
                 color=PALETTE['text'],
             )
             self.fft_annot.set_visible(False)
-            self.fft_canvas.mpl_connect("motion_notify_event", self._hover_fft)
+            # Reconnect the hover handler WITHOUT stacking duplicates: this used to
+            # mpl_connect a NEW handler on every replot (never disconnected), which
+            # churned redraws on mouse-move. Drop the previous one first.
+            if self._fft_hover_cid is not None:
+                self.fft_canvas.mpl_disconnect(self._fft_hover_cid)
+            self._fft_hover_cid = self.fft_canvas.mpl_connect(
+                "motion_notify_event", self._hover_fft)
 
             ax.set_title("FFT Spectrum")
             ax.set_xlabel("Number of Periods")
@@ -3479,9 +3555,11 @@ class DeviceControlApp(tk.Tk):
                 for text_item in legend.get_texts():
                     text_item.set_color(PALETTE['text'])
 
-            with warnings.catch_warnings():
-                warnings.simplefilter('ignore', UserWarning)
-                self.fft_fig.tight_layout()
+            # FIXED margins, NO auto-layout engine. tight_layout()/constrained_layout
+            # recompute on every draw (including the hover draw_idle), which crept the
+            # axes smaller each time and shrank the whole panel toward the top. Fixed
+            # subplotpars are deterministic and never creep.
+            self.fft_fig.subplots_adjust(left=0.12, right=0.96, top=0.90, bottom=0.13)
             self.fft_canvas.draw()
 
     def _hover_fft(self, event):
