@@ -2504,7 +2504,7 @@ class DeviceControlApp(tk.Tk):
         # Cross-step state held in a dict so the on_event closure can mutate it.
         st = {'consecutive_timeouts': 0, 'loss_consecutive_misses': 0,
               'safety_abort': False, 'scan_error': False, 'pending_trip': None,
-              'user_stopped': False}
+              'user_stopped': False, 'violations': None}
         try:
             self._ensure_dpm_node_usable()
             self.nominal_settings.clear()
@@ -2631,7 +2631,12 @@ class DeviceControlApp(tk.Tk):
                                     print("[INFO] Abort data point HAS been saved to scan data")
                                     st['safety_abort'] = True
                                     st['scan_error'] = True
-                                    self._trigger_safety_abort(abort_violations)
+                                    # Record only: _trigger_safety_abort makes blocking
+                                    # ACNET calls (restore), which cannot run inside the
+                                    # engine coroutine (the single executor is busy
+                                    # running it and would stall for the full op
+                                    # timeout); the post-engine handler fires it.
+                                    st['violations'] = abort_violations
                                     self.stop_scan_flag.set()
                                     return None
                             except Exception as e:
@@ -2667,6 +2672,18 @@ class DeviceControlApp(tk.Tk):
                 combined_drf_list, devices_to_scan, _step_values(0), run_config.role,
                 on_event, abort_check=self.stop_scan_flag.is_set, per_event_tmo=5.0,
                 confirm=(_confirm if confirm_mode else None))
+
+            # The engine checks abort_check on every reply, so a user Stop
+            # usually ends it WITHOUT another on_event call: classify the stop
+            # here so the saved status reflects it.
+            if self.stop_scan_flag.is_set() and not (st['safety_abort'] or st['scan_error']):
+                st['user_stopped'] = True
+
+            # Safety abort: the engine has stopped and its worker was retired, so
+            # the executor is fresh; the deferred abort side effects (abort log,
+            # nominal restore, dialog) run HERE, never inside on_event.
+            if st['safety_abort'] and st['violations']:
+                self._trigger_safety_abort(st['violations'])
 
             safety_abort_occurred = st['safety_abort']
             scan_error = st['scan_error']
